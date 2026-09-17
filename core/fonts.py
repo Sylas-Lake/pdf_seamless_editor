@@ -1,0 +1,286 @@
+"""字体恢复与塑形支撑（对应方案第五章）。
+
+处理策略：
+  A. 复用原 PDF 嵌入字体子集（新字符全部在子集内 → 绿色原生编辑）；
+  A' 原字体子集缺字 → 从系统查找同名完整字体（扩展原字体）；
+  C. 字体替代 → PyMuPDF 内置 CJK / Base14 字体（近似字重与衬线匹配）。
+"""
+import os
+
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
+
+from .extractor import _is_mark
+
+BUILTIN_KEYS = {"helv", "tiro", "cour", "symb", "zadb",
+                "china-t", "china-s", "china-ts", "china-ss",
+                "japan", "japan-s", "korea", "korea-s"}
+
+
+def strip_subset_prefix(name: str) -> str:
+    """去掉字体子集前缀：ABCDEF+SimSun → SimSun。"""
+    if not name:
+        return ""
+    return name.split("+", 1)[-1] if "+" in name else name
+
+
+def _has_glyph(font, ch: str) -> bool:
+    try:
+        return font.has_glyph(ord(ch)) > 0
+    except Exception:
+        try:
+            return font.has_glyph(ch) > 0
+        except Exception:
+            return False
+
+
+def covers(font, text: str) -> bool:
+    """字体是否覆盖文本全部基字符（组合符号不计）。"""
+    if not text:
+        return True
+    return all(_has_glyph(font, c) for c in text if not _is_mark(c))
+
+
+def _has_cjk(text: str) -> bool:
+    for c in text:
+        o = ord(c)
+        if (0x2E80 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF
+                or 0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFFEF):
+            return True
+    return False
+
+
+# ------------------------------------------------------- Windows 系统字体查找
+
+_FONT_DIR = None
+_REG_FONTS = None
+_ALIAS = {
+    "simsun": "simsun.ttc", "nsimsun": "simsun.ttc", "宋体": "simsun.ttc",
+    "新宋体": "simsun.ttc", "microsoft yahei": "msyh.ttc", "微软雅黑": "msyh.ttc",
+    "simhei": "simhei.ttf", "黑体": "simhei.ttf", "kaiti": "simkai.ttf",
+    "楷体": "simkai.ttf", "simkai": "simkai.ttf", "fangsong": "simfang.ttf",
+    "仿宋": "simfang.ttf", "simfang": "simfang.ttf", "dengxian": "deng.ttf",
+    "等线": "deng.ttf", "deng": "deng.ttf", "微软雅黑 light": "msyhlight.ttc",
+    "arial": "arial.ttf", "calibri": "calibri.ttf", "times new roman": "times.ttf",
+}
+
+
+def _font_dir() -> str:
+    global _FONT_DIR
+    if _FONT_DIR is None:
+        _FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    return _FONT_DIR
+
+
+def _registry_fonts() -> dict:
+    """注册表字体名 → 文件名映射（惰性加载一次）。"""
+    global _REG_FONTS
+    if _REG_FONTS is not None:
+        return _REG_FONTS
+    _REG_FONTS = {}
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+        i = 0
+        while True:
+            try:
+                name, value, _t = winreg.EnumValue(key, i)
+                i += 1
+            except OSError:
+                break
+            if isinstance(value, str):
+                _REG_FONTS[name.lower()] = value
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    return _REG_FONTS
+
+
+def system_font_candidates(family: str) -> list:
+    """按族名查找系统字体文件候选（策略 A'：扩展原字体）。"""
+    fam = (family or "").strip()
+    if not fam:
+        return []
+    fam_l = fam.lower()
+    if fam_l in ("helvetica", "arial", "sans-serif"):
+        pass  # 仍尝试系统 Arial，但内置 helv 也可兜底
+    out = []
+    d = _font_dir()
+
+    def _add(path):
+        if path and os.path.isfile(path) and path not in out:
+            out.append(path)
+
+    # 1) 别名直查
+    if fam_l in _ALIAS:
+        _add(os.path.join(d, _ALIAS[fam_l]))
+    if fam in _ALIAS:
+        _add(os.path.join(d, _ALIAS[fam]))
+    # 2) 注册表族名匹配（中文名/英文名/变体）
+    reg = _registry_fonts()
+    for name, fn in reg.items():
+        nn = name.replace("(truetype)", "").replace("(opentype)", "").strip()
+        if nn and (nn == fam_l or nn.startswith(fam_l + " ")
+                  or nn.endswith(" " + fam_l) or (" " + fam_l + " ") in (" " + nn + " ")):
+            _add(fn if os.path.isabs(fn) else os.path.join(d, fn))
+    # 3) 目录宽松匹配
+    key = fam_l.replace(" ", "")
+    if len(key) >= 4:
+        try:
+            for fn in os.listdir(d):
+                fl = fn.lower()
+                if fl.startswith(key) and fl.endswith((".ttf", ".ttc", ".otf")):
+                    _add(os.path.join(d, fn))
+        except Exception:
+            pass
+    return out[:8]
+
+
+# ---------------------------------------------------------------- 解析器
+
+class ResolvedFont:
+    """一次字体解析的结果。"""
+    __slots__ = ("key", "font", "is_original", "source", "coverage_ok")
+
+    def __init__(self, key, font, is_original, source, coverage_ok=True):
+        self.key = key              # insert_text 使用的 fontname
+        self.font = font            # fitz.Font（测量/覆盖检查）
+        self.is_original = is_original
+        self.source = source        # 来源说明（保真原因展示）
+        self.coverage_ok = coverage_ok
+
+
+class FontResolver:
+    """文档级字体解析器：原始子集 → 系统完整字体 → 内置替代。"""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self._reg = {}          # key -> {"fontbuffer":..} | {"fontfile":..}
+        self._by_buf = {}      # bytes hash -> key（去重）
+        self._by_file = {}     # path -> key
+        self._sys_cache = {}   # path -> fitz.Font | None
+        self._page_keys = {}   # page.number -> set(key)（已注册到页面资源）
+
+    # -- 注册 --
+    def _register_buffer(self, buf: bytes) -> str:
+        h = hash(buf)
+        if h in self._by_buf:
+            return self._by_buf[h]
+        key = "EF%03d" % (len(self._reg) + 1)
+        self._reg[key] = {"fontbuffer": buf}
+        self._by_buf[h] = key
+        return key
+
+    def _register_file(self, path: str) -> str:
+        if path in self._by_file:
+            return self._by_file[path]
+        key = "EF%03d" % (len(self._reg) + 1)
+        self._reg[key] = {"fontfile": path}
+        self._by_file[path] = key
+        return key
+
+    def ensure_page_font(self, page, rf: ResolvedFont) -> str:
+        """把解析出的字体注册进页面资源（幂等），返回可用 fontname。"""
+        if rf.key in BUILTIN_KEYS:
+            return rf.key
+        spec = self._reg.get(rf.key)
+        if not spec:
+            return "helv"
+        done = self._page_keys.setdefault(page.number, set())
+        if rf.key not in done:
+            page.insert_font(fontname=rf.key, **spec)
+            done.add(rf.key)
+        return rf.key
+
+    # -- 解析 --
+    def resolve(self, page, style, text: str) -> ResolvedFont:
+        base = strip_subset_prefix(style.font_name or "")
+
+        # 策略 A：复用原始嵌入字体（子集覆盖检查）
+        if base:
+            try:
+                fonts = page.get_fonts(full=True)
+            except Exception:
+                fonts = []
+            for finfo in fonts:
+                basefont = finfo[3] if len(finfo) > 3 else ""
+                if not basefont:
+                    continue
+                if basefont != style.font_name and strip_subset_prefix(basefont) != base:
+                    continue
+                buf = None
+                try:
+                    ef = self.doc.extract_font(finfo[0])
+                    if isinstance(ef, dict):
+                        buf = ef.get("image") or ef.get("content")
+                    elif isinstance(ef, (tuple, list)) and len(ef) >= 4:
+                        buf = ef[3]
+                except Exception:
+                    buf = None
+                if buf:
+                    f = self._load_buffer(buf)
+                    if f is not None and covers(f, text):
+                        key = self._register_buffer(buf)
+                        return ResolvedFont(key, f, True, "复用原始嵌入字体")
+                else:
+                    # 原字体为内置命名资源（如 PyMuPDF 的 /china-s）：
+                    # 直接复用页面字体资源（策略 A'）
+                    resname = finfo[4] if len(finfo) > 4 else ""
+                    if resname in BUILTIN_KEYS:
+                        f = self._load_buffer(None, resname)
+                        if f is not None and covers(f, text):
+                            return ResolvedFont(resname, f, True,
+                                                "复用原内置字体资源")
+
+        # 策略 A'：系统同名完整字体（扩展原字体）
+        if base:
+            for path in system_font_candidates(base):
+                f = self._load_file(path)
+                if f is not None and covers(f, text):
+                    key = self._register_file(path)
+                    return ResolvedFont(key, f, False,
+                                        "系统同名完整字体（扩展原字体）")
+
+        # 策略 C：内置替代字体（衬线/无衬线匹配）
+        serif = bool(style.flags & 4) if style.flags else base.lower().endswith(("simsun", "song", "serif", "times", "宋体"))
+        prefer = ["china-s", "china-ss"] if serif else ["china-ss", "china-s"]
+        if not _has_cjk(text):
+            prefer = ["helv", "china-ss"]
+        for key in prefer:
+            f = self._load_buffer(None, key)
+            if f is not None and covers(f, text):
+                return ResolvedFont(key, f, False, f"内置替代字体 {key}")
+        # 覆盖不全也退回首选（保真降级为黄色/警告）
+        f = self._load_buffer(None, prefer[0])
+        return ResolvedFont(prefer[0], f, False, f"内置替代字体 {prefer[0]}（部分字符缺字形）", coverage_ok=False)
+
+    # -- 字体加载缓存 --
+    def _load_buffer(self, buf, builtin=None):
+        if builtin:
+            try:
+                return fitz.Font(builtin)
+            except Exception:
+                return None
+        try:
+            f = fitz.Font(fontbuffer=buf)
+            if f.glyph_count == 0:
+                return None
+            return f
+        except Exception:
+            return None
+
+    def _load_file(self, path):
+        if path in self._sys_cache:
+            return self._sys_cache[path]
+        f = None
+        try:
+            f = fitz.Font(fontfile=path)
+            if f.glyph_count == 0:
+                f = None
+        except Exception:
+            f = None
+        self._sys_cache[path] = f
+        return f
