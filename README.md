@@ -25,7 +25,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-启动后若当前目录存在 `示例文档.pdf` 会自动打开。也可以：
+启动后为空工作台，由用户自行打开 PDF。也可以：
 
 ```bash
 python main.py --demo 示例文档.pdf
