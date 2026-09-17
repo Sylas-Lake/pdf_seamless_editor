@@ -31,12 +31,52 @@ def main():
     app.processEvents()
 
     # 1. 打开示例
-    win.make_sample()
+    import tempfile
+    from core.sample import create_sample_pdf
+    fd, sample_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    create_sample_pdf(sample_path)
+    win.open_file(sample_path)
     app.processEvents()
     check("打开文档", win.doc is not None and win.doc.page_count == 2)
     check("文本框模型", win._model() is not None and len(win._model().blocks) > 5)
     check("缩略图", win.thumb_list.count() == 2)
     check("保真初始为绿", win.fidelities[0].level == "green")
+
+    from PySide6.QtWidgets import QToolButton
+    bar_names = []
+    for w in win.chrome._items:
+        act = w.defaultAction() if isinstance(w, QToolButton) else None
+        if act is not None:
+            bar_names.append(act.text())
+    check("图标栏无生成示例", "生成示例" not in bar_names)
+    check("图标栏无剪切复制粘贴全选",
+          not any(t in bar_names for t in ("剪切", "复制", "粘贴", "全选")))
+    check("剪贴板快捷键仍在",
+          "Ctrl+X" in win.act_cut.shortcut().toString().replace(" ", ""))
+
+    win.act_thumbs.setChecked(True)
+    app.processEvents()
+    check("开目录后画布右移", win.canvas.x() == win.stage.LEFT_W)
+    check("开目录后画布让位",
+          win.canvas.width() == win.stage.width() - win.stage.LEFT_W)
+    win.act_thumbs.setChecked(False)
+    app.processEvents()
+    win.act_props.setChecked(True)
+    app.processEvents()
+    check("开属性后画布让位",
+          win.canvas.width() == win.stage.width() - win.stage.RIGHT_W)
+    win.act_props.setChecked(False)
+    app.processEvents()
+
+    win.canvas._last_page_turn = 0
+    win.canvas._try_page_turn(1, "top")
+    app.processEvents()
+    check("页边翻到下一页", win.page_no == 1)
+    win.canvas._last_page_turn = 0
+    win.canvas._try_page_turn(-1, "bottom")
+    app.processEvents()
+    check("页边翻回上一页", win.page_no == 0)
 
     # 2. 双击进入会话（Windows 序列：Press → Release → DblClick）
     from PySide6.QtCore import QEvent, QPointF, Qt
@@ -222,7 +262,20 @@ def main():
             pass
 
     print(f"\nGUI 冒烟结果：{PASS} 通过 / {FAIL} 失败")
+    if win.session is not None:
+        win.cancel_session()
+    win.undo_stack.clear()
+    if win.doc is not None:
+        try:
+            win.doc.close()
+        except Exception:
+            pass
+        win.doc = None
     win.close()
+    try:
+        os.remove(sample_path)
+    except OSError:
+        pass
     sys.exit(0 if FAIL == 0 else 1)
 
 
