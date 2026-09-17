@@ -1,9 +1,10 @@
-"""主窗口：编辑控制器 + 客户端编辑层编排。
+"""主窗口 v2：文本框会话编辑控制器。
 
-对应方案第九章推荐架构：
-  客户端编辑层（本窗口/画布/面板）
-  ↕ 文档中间层（core.commands 统一命令 + 撤销栈）
-  ↕ PDF 核心引擎（PyMuPDF + core.executor 内容流重写）
+编辑模型（类 PPT）：
+  - 单击文本框 → 选中（可拖动移动 / 左右手柄调宽）
+  - 双击文本框 → 进入编辑（框内缓冲，光标/选区/输入法自然工作）
+  - 提交 → 整体重建（一次 redact + 按行插入）
+  - 撤销/重做 → 页面快照字节级恢复（真正回到原版 PDF）
 """
 import os
 import tempfile
@@ -14,28 +15,42 @@ try:
 except ImportError:
     import fitz
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget,
-                                QFileDialog, QInputDialog, QLabel, QLineEdit,
-                                QListWidget, QListWidgetItem, QMainWindow,
-                                QMessageBox, QToolBar, QWidget)
+                               QFileDialog, QInputDialog, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QToolBar)
 
 from core import executor, verifier
-from core.commands import (ImageDeleteCommand, ImageReplaceCommand,
-                           ImageState, ImageTransformCommand, TextStyleCommand,
-                           TextEditCommand, UndoStack)
-from core.extractor import (boundary_x, cursor_index_at, extract_page,
-                             find_line, find_line_by_bbox, inherited_style,
-                             n_grapheme_clusters, select_word_at, word_step)
-from core.fidelity import COLORS, LABELS, PageFidelity
-from core.fonts import FontResolver
+from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
+from core.extractor import extract_page
+from core.fidelity import COLORS, LABELS, PageFidelity, worse
+from core.fonts import FontOracle, FontResolver
+from core.models import TextBlock
 from core.sample import create_sample_pdf
+from core.snapshot import (capture_page_state, restore_page_state,
+                           page_state_equal)
+from core.textbox import BoxBuffer
 from ui.diff_dialog import DiffDialog
 from ui.page_canvas import PageCanvas
 from ui.property_panel import PropertyPanel
 
-APP_TITLE = "PDF 无感编辑器 · 第一阶段 MVP"
+APP_TITLE = "PDF 无感编辑器 · 文本框编辑版"
+
+
+class EditSession:
+    """一次文本框编辑会话。"""
+
+    def __init__(self, block, page_index, buffer, before_state, oracle):
+        self.block = block
+        self.page_index = page_index
+        self.buffer = buffer
+        self.before_state = before_state
+        self.oracle = oracle
+        self.cursor = (0, 0)
+        self.selection = None      # (anchor, focus) 框内缓冲坐标
+        self.preedit = ""
 
 
 class MainWindow(QMainWindow):
@@ -44,40 +59,34 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1280, 860)
 
-        # ---- 文档状态 ----
         self.doc = None
         self.doc_path = ""
         self.resolver = None
+        self.ctx = None
         self.models = {}
         self.orig_renders = {}
         self.edit_regions = {}
         self.fidelities = {}
         self._can_modify = True
 
-        # ---- 编辑状态 ----
-        self.cursor = None          # (line_index, glyph_index)
-        self.selection = None       # (anchor, focus)
-        self._sel_image = None
+        self.session = None
+        self.selected_block = None
+        self.selected_image = None
         self._overflow_strategy = "shrink"
         self.zoom = 1.0
         self.page_no = 0
 
         self.undo_stack = UndoStack(on_change=self._update_undo_actions)
-        self.ctx = None
 
         self._build_ui()
 
     # ================================================== UI 构建
     def _build_ui(self):
-        # 画布
         self.canvas = PageCanvas(self)
         self.setCentralWidget(self.canvas)
         self.canvas.hover_pos.connect(self._on_hover)
-        self.canvas.image_transform_committed.connect(self.commit_image_transform)
-        self.canvas.image_delete_requested.connect(self.delete_selected_image)
         self.canvas.image_replace_requested.connect(self.replace_selected_image)
 
-        # 工具栏
         tb = QToolBar("主工具栏")
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -85,12 +94,10 @@ class MainWindow(QMainWindow):
         self.act_open.setShortcut("Ctrl+O")
         self.act_open.triggered.connect(lambda: self.open_file())
         tb.addAction(self.act_open)
-
         self.act_save = QAction("保存", self)
         self.act_save.setShortcut("Ctrl+S")
         self.act_save.triggered.connect(self.save)
         tb.addAction(self.act_save)
-
         self.act_verify = QAction("验证报告", self)
         self.act_verify.triggered.connect(self.reverify)
         tb.addAction(self.act_verify)
@@ -132,15 +139,6 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_next)
         tb.addSeparator()
 
-        self.cmb_mode = QComboBox()
-        self.cmb_mode.addItem("模式：原位替换（固定版式）")
-        self.cmb_mode.addItem("段落重排（第二阶段）")
-        self.cmb_mode.addItem("自由布局（第二阶段）")
-        self.cmb_mode.model().item(1).setEnabled(False)
-        self.cmb_mode.model().item(2).setEnabled(False)
-        self.cmb_mode.setToolTip("第一阶段仅支持原位替换模式")
-        tb.addWidget(self.cmb_mode)
-
         self.act_sample = QAction("生成示例", self)
         self.act_sample.triggered.connect(self.make_sample)
         tb.addAction(self.act_sample)
@@ -157,8 +155,6 @@ class MainWindow(QMainWindow):
 
         # 右侧属性面板
         self.panel = PropertyPanel(self)
-        self.panel.apply_style.connect(self.apply_style_to_selection)
-        self.panel.overflow_changed.connect(self._set_overflow)
         dock_p = QDockWidget("属性", self)
         dock_p.setWidget(self.panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock_p)
@@ -183,17 +179,17 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_undo)
         m_edit.addAction(self.act_redo)
         m_edit.addSeparator()
-        act_selall = QAction("全选（本页文本）", self)
+        act_selall = QAction("全选（框内）", self)
         act_selall.setShortcut("Ctrl+A")
-        act_selall.triggered.connect(self.select_all)
+        act_selall.triggered.connect(self.session_select_all)
         m_edit.addAction(act_selall)
         act_copy = QAction("复制", self)
         act_copy.setShortcut("Ctrl+C")
-        act_copy.triggered.connect(self.copy_selection)
+        act_copy.triggered.connect(self.copy)
         m_edit.addAction(act_copy)
         act_cut = QAction("剪切", self)
         act_cut.setShortcut("Ctrl+X")
-        act_cut.triggered.connect(self.cut_selection)
+        act_cut.triggered.connect(self.cut)
         m_edit.addAction(act_cut)
         act_paste = QAction("粘贴", self)
         act_paste.setShortcut("Ctrl+V")
@@ -217,7 +213,7 @@ class MainWindow(QMainWindow):
 
         # 状态栏
         self.lb_pos = QLabel("—")
-        self.lb_mode = QLabel("原位替换模式")
+        self.lb_mode = QLabel("文本框编辑模式（类 PPT）")
         self.lb_fid = QLabel("未打开")
         self.lb_fid.setStyleSheet("color:#fff; background:#888; border-radius:3px; padding:2 8px;")
         sb = self.statusBar()
@@ -225,14 +221,14 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.lb_mode)
         sb.addPermanentWidget(self.lb_fid)
 
-        self.canvas.set_hint("请打开 PDF 文件，或点击工具栏「生成示例」")
+        self.canvas.set_hint("打开 PDF 后：单击选中文本框，双击进入编辑；图片可拖动/缩放/旋转")
         self._update_undo_actions()
 
     # ================================================== 文档管理
     def open_file(self, path=None):
         if path is None:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "打开 PDF", "", "PDF 文件 (*.pdf)")
+            path, _ = QFileDialog.getOpenFileName(self, "打开 PDF", "",
+                                                  "PDF 文件 (*.pdf)")
             if not path:
                 return
         try:
@@ -263,15 +259,15 @@ class MainWindow(QMainWindow):
         self.ctx = SimpleNamespace(doc=doc, resolver=self.resolver)
         self.models, self.orig_renders, self.edit_regions, self.fidelities = {}, {}, {}, {}
         self.undo_stack.clear()
-        self.cursor = None
-        self.selection = None
-        self._sel_image = None
+        self.session = None
+        self.selected_block = None
+        self.selected_image = None
         perm = getattr(fitz, "PDF_PERM_MODIFY", 4)
         self._can_modify = (not doc.is_encrypted) or bool(doc.permissions & perm)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
         self.set_page(0)
         self._build_thumbs()
-        self.status_hint("文档已打开：编辑将直接修改内容流（真删除，非遮盖）")
+        self.status_hint("编辑直接修改内容流（真删除，非遮盖）；撤销为字节级原版恢复")
 
     def current_page(self):
         if self.doc is None:
@@ -284,11 +280,12 @@ class MainWindow(QMainWindow):
     def set_page(self, i):
         if self.doc is None:
             return
+        if self.session is not None:
+            self.commit_session()
         i = max(0, min(i, self.doc.page_count - 1))
         self.page_no = i
-        self.cursor = None
-        self.selection = None
-        self._sel_image = None
+        self.selected_block = None
+        self.selected_image = None
         page = self.doc[i]
         if i not in self.models:
             self.models[i] = extract_page(page, i)
@@ -302,9 +299,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_page_content(pm, model, model.rect[2], model.rect[3])
         self.canvas.set_hint("")
         self.canvas.apply_zoom()
-        self.canvas.update_cursor_item()
-        self.canvas.update_selection_items()
-        self.canvas._refresh_handles()
+        self.canvas.refresh_overlays()
         self.lb_page.setText(f"{i + 1} / {self.doc.page_count}")
         self.thumb_list.setCurrentRow(i)
         self._update_panels()
@@ -322,15 +317,13 @@ class MainWindow(QMainWindow):
         self.thumb_list.clear()
         if self.doc is None:
             return
-        w = 120
         for i in range(self.doc.page_count):
             page = self.doc[i]
-            zw = w / max(page.rect.width, 1)
+            zw = 120 / max(page.rect.width, 1)
             pix = page.get_pixmap(matrix=fitz.Matrix(zw, zw), alpha=False)
             img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                          QImage.Format.Format_RGB888).copy()
-            it = QListWidgetItem(QPixmap.fromImage(img), f"{i + 1}")
-            self.thumb_list.addItem(it)
+            self.thumb_list.addItem(QListWidgetItem(QPixmap.fromImage(img), f"{i + 1}"))
             if i % 5 == 4:
                 QApplication.processEvents()
 
@@ -344,173 +337,41 @@ class MainWindow(QMainWindow):
                      QImage.Format.Format_RGB888).copy()
         self.thumb_list.item(i).setIcon(QPixmap.fromImage(img))
 
-    # ================================================== 光标/选区 API（画布调用）
-    def cursor_state(self):
-        model = self._model()
-        if model is None or self.cursor is None:
-            return None
-        li, gi = self.cursor
-        if 0 <= li < len(model.lines):
-            return model.lines[li], gi
-        return None
-
-    def hit_test(self, x, y):
+    # ================================================== 命中与选择
+    def hit_block(self, x, y):
         model = self._model()
         if model is None:
             return None
-        line = find_line(model, x, y)
-        if line is None or not line.horizontal:
-            return None
-        return line.index, cursor_index_at(line, x)
+        return model.block_at(x, y)
 
-    def set_cursor(self, li, gi, extend=False):
-        if not self._editable_page():
-            return
-        model = self._model()
-        if model is None or not (0 <= li < len(model.lines)):
-            return
-        line = model.lines[li]
-        gi = max(0, min(gi, len(line.glyphs)))
-        if extend and (self.selection or self.cursor is not None):
-            anchor = self.selection[0] if self.selection else self.cursor
-            self.selection = (anchor, (li, gi))
-            self.cursor = (li, gi)
-        else:
-            self.cursor = (li, gi)
-            self.selection = None
-        self._update_canvas_overlays()
-
-    def extend_selection(self, li, gi):
-        model = self._model()
-        if model is None or not (0 <= li < len(model.lines)):
-            return
-        if self.selection is None:
-            if self.cursor is None:
-                return
-            self.selection = (self.cursor, (li, gi))
-        else:
-            self.selection = (self.selection[0], (li, gi))
-        self.cursor = (li, gi)
-        self._update_canvas_overlays()
-
-    def select_word(self, li, gi):
-        model = self._model()
-        if model is None or not (0 <= li < len(model.lines)):
-            return
-        line = model.lines[li]
-        a, b = select_word_at(line, gi)
-        self.selection = ((li, a), (li, b))
-        self.cursor = (li, b)
-        self._update_canvas_overlays()
-
-    def select_line(self, li):
-        model = self._model()
-        if model is None or not (0 <= li < len(model.lines)):
-            return
-        line = model.lines[li]
-        self.selection = ((li, 0), (li, len(line.glyphs)))
-        self.cursor = (li, len(line.glyphs))
-        self._update_canvas_overlays()
-
-    def select_all(self):
-        model = self._model()
-        if model is None or not model.lines:
-            return
-        last = len(model.lines) - 1
-        self.selection = ((0, 0), (last, len(model.lines[last].glyphs)))
-        self.cursor = (last, len(model.lines[last].glyphs))
-        self._update_canvas_overlays()
-
-    def clear_selection(self):
-        self.selection = None
-        self.canvas.update_selection_items()
-        self._update_sel_stats()
-
-    def selection_segments(self):
-        model = self._model()
-        if model is None or self.selection is None or not model.lines:
-            return []
-        (la, ia), (lf, iff) = self.selection
-        la = max(0, min(la, len(model.lines) - 1))
-        lf = max(0, min(lf, len(model.lines) - 1))
-        if la == lf:
-            if ia == iff:
-                return []
-            return [(model.lines[la], min(ia, iff), max(ia, iff))]
-        segs = []
-        if la < lf:
-            segs.append((la, ia, len(model.lines[la].glyphs)))
-            for l in range(la + 1, lf):
-                segs.append((l, 0, len(model.lines[l].glyphs)))
-            segs.append((lf, 0, iff))
-        else:
-            segs.append((la, 0, ia))
-            for l in range(la - 1, lf, -1):
-                segs.append((l, 0, len(model.lines[l].glyphs)))
-            segs.append((lf, iff, len(model.lines[lf].glyphs)))
-        return [(model.lines[l], s, e) for (l, s, e) in segs]
-
-    def selection_text(self):
-        segs = self.selection_segments()
-        if not segs:
-            return ""
-        return "\n".join("".join(g.char for g in line.glyphs[s:e])
-                         for (line, s, e) in segs)
-
-    def move_cursor(self, delta, word=False, extend=False):
-        model = self._model()
-        if model is None or self.cursor is None:
-            return
-        li, gi = self.cursor
-        if not (0 <= li < len(model.lines)):
-            return
-        line = model.lines[li]
-        if word:
-            ngi = word_step(line, gi, delta > 0)
-        else:
-            ngi = gi + delta
-        ngi = max(0, min(ngi, len(line.glyphs)))
-        self.set_cursor(li, ngi, extend)
-
-    def move_cursor_vertical(self, dy, extend=False):
-        model = self._model()
-        if model is None or self.cursor is None or not model.lines:
-            return
-        li, gi = self.cursor
-        nl = max(0, min(li + dy, len(model.lines) - 1))
-        x = boundary_x(model.lines[li], gi)
-        ngi = cursor_index_at(model.lines[nl], x)
-        self.set_cursor(nl, ngi, extend)
-
-    def move_cursor_edge(self, head, page=False, extend=False):
-        model = self._model()
-        if model is None or self.cursor is None or not model.lines:
-            return
-        li, gi = self.cursor
-        if page:
-            li = 0 if head else len(model.lines) - 1
-            gi = 0 if head else len(model.lines[li].glyphs)
-        else:
-            line = model.lines[li]
-            gi = 0 if head else len(line.glyphs)
-        self.set_cursor(li, gi, extend)
-
-    def current_style(self):
+    def image_at(self, x, y):
         model = self._model()
         if model is None:
             return None
-        segs = self.selection_segments()
-        if segs:
-            line, s, _e = segs[0]
-            if line.glyphs:
-                return inherited_style(line, s)
-        if self.cursor is not None:
-            li, gi = self.cursor
-            if 0 <= li < len(model.lines):
-                return inherited_style(model.lines[li], gi)
-        return None
+        return model.image_at(x, y)
 
-    # ================================================== 文本编辑
+    def select_block(self, block):
+        if not self._editable():
+            return
+        self.selected_block = block
+        self.selected_image = None
+        self.canvas.refresh_overlays()
+        self.status_hint("文本框已选中：拖动移动，左右手柄调宽；双击进入编辑；Delete 删除")
+
+    def select_image(self, img):
+        if not self._editable():
+            return
+        self.selected_image = img
+        self.selected_block = None
+        self.canvas.refresh_overlays()
+        self.status_hint("图片已选中：拖动移动，8 控制点缩放，圆形手柄旋转；Delete 删除")
+
+    def deselect_all(self):
+        self.selected_block = None
+        self.selected_image = None
+        self.canvas.refresh_overlays()
+
+    # ================================================== 会话生命周期
     def _editable(self):
         if self.doc is None:
             self.status_hint("请先打开 PDF 文件")
@@ -520,254 +381,406 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _editable_page(self):
+    def start_session(self, block):
         if not self._editable():
-            return False
-        model = self._model()
-        if model is not None and model.rotation % 360 != 0:
-            self.status_hint("旋转页面编辑可能产生偏移，请谨慎操作")
-        return True
+            return
+        if self.session is not None:
+            self.commit_session()
+        if not block.horizontal:
+            self.status_hint("旋转/竖排文本暂不支持（第二阶段）")
+            return
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        executor.remove_text_region(page, _expand(block.bbox, 0.6))
+        buffer = BoxBuffer(block)
+        oracle = FontOracle(self.resolver, page)
+        sess = EditSession(block, self.page_no, buffer, before, oracle)
+        self.session = sess
+        self.selected_block = None
+        self.selected_image = None
+        # 光标置于框首
+        sess.cursor = (0, 0)
+        self._refresh_render_only()
+        self.canvas.refresh_overlays()
+        self.status_hint("编辑中：单击定位，拖选/双击选词，Enter 换行，Esc 取消，点击框外提交")
+        self._update_panels()
 
-    def insert_text(self, text):
-        if not self._editable_page():
+    def commit_session(self):
+        sess = self.session
+        if sess is None:
+            return
+        self.session = None
+        self.session_preedit_clear()
+        page = self.current_page()
+        if not sess.buffer.changed:
+            # 无变化：字节级还原
+            restore_page_state(self.doc, page, sess.before_state)
+            self._refresh_page()
+            return
+        runs = sess.buffer.commit_runs(sess.oracle)
+        executor.insert_runs(page, runs, self.resolver)
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand("编辑文本框", self.page_no,
+                               sess.before_state, after)
+        cmd.edit_rects = [_expand(sess.block.bbox, 1.0),
+                          sess.buffer.bbox()]
+        self._register_cmd(cmd, sess.buffer, runs)
+
+    def cancel_session(self):
+        sess = self.session
+        if sess is None:
+            return
+        self.session = None
+        self.session_preedit_clear()
+        page = self.current_page()
+        restore_page_state(self.doc, page, sess.before_state)
+        self._refresh_page()
+        self.status_hint("已取消编辑（字节级恢复原版）")
+
+    def _register_cmd(self, cmd, buffer=None, runs=None):
+        self.undo_stack.push(cmd, self.ctx)
+        fid = self.fidelities.setdefault(self.page_no, PageFidelity())
+        model = self._model()
+        if model is not None and model.scanned:
+            fid.level = "red"
+            if model.scanned_note not in fid.reasons:
+                fid.reasons.append(model.scanned_note)
+        if buffer is not None and runs is not None:
+            level = "green"
+            for text, st, x, bl, rf in runs:
+                if not rf.is_original:
+                    level = worse(level, "yellow")
+                    r = f"新增字符使用{rf.source}"
+                    if r not in fid.reasons:
+                        fid.reasons.append(r)
+            if len(buffer.visual) > getattr(buffer, "_orig_visual_count", 0):
+                if "内容重排（自动换行）" not in fid.reasons:
+                    fid.reasons.append("内容重排（自动换行）")
+                level = worse(level, "yellow")
+            fid.level = worse(fid.level, level)
+        for r in getattr(cmd, "edit_rects", []) or []:
+            self.edit_regions.setdefault(self.page_no, []).append(tuple(r))
+        self._refresh_page()
+
+    # ================================================== 会话编辑操作
+    def session_click(self, x, y, extend=False):
+        sess = self.session
+        if sess is None:
+            return
+        pos = sess.buffer.hit_test(x, y, sess.oracle.adv_fn())
+        if extend and sess.cursor is not None:
+            anchor = sess.selection[0] if sess.selection else sess.cursor
+            sess.selection = (anchor, pos)
+        else:
+            sess.selection = None
+        sess.cursor = pos
+        self.canvas.box_editor.update()
+
+    def session_drag(self, x, y):
+        sess = self.session
+        if sess is None:
+            return
+        pos = sess.buffer.hit_test(x, y, sess.oracle.adv_fn())
+        anchor = sess.selection[0] if sess.selection else sess.cursor
+        sess.selection = (anchor, pos)
+        sess.cursor = pos
+        self.canvas.box_editor.update()
+
+    def session_select_word(self, x, y):
+        sess = self.session
+        if sess is None:
+            return
+        pos = sess.buffer.hit_test(x, y, sess.oracle.adv_fn())
+        hl, off = pos
+        a, b = sess.buffer.word_bounds(pos)
+        sess.selection = ((hl, a), (hl, b))
+        sess.cursor = (hl, b)
+        self.canvas.box_editor.update()
+
+    def session_select_visual_line(self, x, y):
+        sess = self.session
+        if sess is None:
+            return
+        adv = sess.oracle.adv_fn()
+        pos = sess.buffer.hit_test(x, y, adv)
+        # 找到所在可视行
+        best_v, best_d = None, None
+        for v in sess.buffer.visual:
+            d = abs(y - v.baseline)
+            if best_d is None or d < best_d:
+                best_v, best_d = v, d
+        if best_v is None:
+            return
+        sess.selection = ((best_v.hard_idx, best_v.start), (best_v.hard_idx, best_v.end))
+        sess.cursor = (best_v.hard_idx, best_v.end)
+        self.canvas.box_editor.update()
+
+    def session_select_all(self):
+        sess = self.session
+        if sess is None:
+            if self.selected_block is not None:
+                t = self.selected_block.text()
+                if t:
+                    QApplication.clipboard().setText(t)
+                    self.status_hint("已复制选中文本框内容")
+            return
+        hl = len(sess.buffer.hard_lines) - 1
+        sess.selection = ((0, 0), (hl, len(sess.buffer.hard_lines[hl])))
+        sess.cursor = (hl, len(sess.buffer.hard_lines[hl]))
+        self.canvas.box_editor.update()
+
+    def session_insert(self, text):
+        sess = self.session
+        if sess is None:
             return
         text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
-        if self.selection:
-            self._replace_selection(text)
-            return
-        if "\n" in text:
-            self._paste_multiline(text)
-            return
-        if self.cursor is None:
-            self.status_hint("请先在页面文本处单击以定位光标")
-            return
-        model = self._model()
-        li, gi = self.cursor
-        line = model.lines[li]
-        rb = executor.make_rebuild(self.page_no, line, gi, gi, text,
-                                   self._overflow_strategy)
-        self._push_text_cmd("输入文本", [rb],
-                            (li, gi, line.bbox),
-                            (line.bbox, gi + n_grapheme_clusters(text)))
+        if sess.selection:
+            sess.cursor = self._session_delete_selection()
+        sess.cursor = sess.buffer.insert(sess.cursor, text)
+        self.canvas.refresh_overlays()
+        self._update_panels()
 
-    def backspace(self):
-        if not self._editable_page():
+    def session_split_line(self):
+        sess = self.session
+        if sess is None:
             return
-        if self.selection:
-            self._delete_selection()
-            return
-        if self.cursor is None:
-            return
-        model = self._model()
-        li, gi = self.cursor
-        line = model.lines[li]
-        if gi <= 0:
-            self.status_hint("行首退格需要段落重排（第二阶段），请在行内删除")
-            return
-        rb = executor.make_rebuild(self.page_no, line, gi - 1, gi, "",
-                                   self._overflow_strategy)
-        self._push_text_cmd("删除文本", [rb], (li, gi, line.bbox), (line.bbox, gi - 1))
+        if sess.selection:
+            self._session_delete_selection()
+        sess.cursor = sess.buffer.split_line(sess.cursor)
+        self.canvas.refresh_overlays()
 
-    def delete_forward(self):
-        if not self._editable_page():
+    def session_backspace(self):
+        sess = self.session
+        if sess is None:
             return
-        if self.selection:
-            self._delete_selection()
-            return
-        if self.cursor is None:
-            return
-        model = self._model()
-        li, gi = self.cursor
-        line = model.lines[li]
-        if gi >= len(line.glyphs):
-            self.status_hint("行尾删除需要段落重排（第二阶段）")
-            return
-        rb = executor.make_rebuild(self.page_no, line, gi, gi + 1, "",
-                                   self._overflow_strategy)
-        self._push_text_cmd("删除文本", [rb], (li, gi, line.bbox), (line.bbox, gi))
-
-    def _delete_selection(self):
-        segs = self.selection_segments()
-        if not segs:
-            return
-        rbs = []
-        if len(segs) == 1:
-            line, s, e = segs[0]
-            rbs.append(executor.make_rebuild(self.page_no, line, s, e, "",
-                                             self._overflow_strategy))
+        if sess.selection:
+            sess.cursor = self._session_delete_selection()
         else:
-            first_line, s, _ = segs[0]
-            rbs.append(executor.make_rebuild(self.page_no, first_line, s,
-                                             len(first_line.glyphs), "",
-                                             self._overflow_strategy))
-            for line, _s, _e in segs[1:-1]:
-                rbs.append(executor.make_rebuild(self.page_no, line, 0,
-                                                 len(line.glyphs), "",
-                                                 self._overflow_strategy))
-            last_line, _s2, e2 = segs[-1]
-            rbs.append(executor.make_rebuild(self.page_no, last_line, 0, e2, "",
-                                             self._overflow_strategy))
-        line0, s0, _e0 = segs[0]
-        self._push_text_cmd("删除文本", rbs,
-                            (line0.index, s0, line0.bbox),
-                            (line0.bbox, s0))
+            sess.cursor = sess.buffer.backspace(sess.cursor)
+        self.canvas.refresh_overlays()
 
-    def _replace_selection(self, text):
-        segs = self.selection_segments()
-        if not segs:
+    def session_delete_forward(self):
+        sess = self.session
+        if sess is None:
             return
-        rbs = []
-        for k, (line, s, e) in enumerate(segs):
-            rbs.append(executor.make_rebuild(self.page_no, line, s, e,
-                                             text if k == 0 else "",
-                                             self._overflow_strategy))
-        self._push_text_cmd("替换文本", rbs,
-                            (segs[0][0].index, segs[0][1], segs[0][0].bbox),
-                            (segs[0][0].bbox, segs[0][1] + n_grapheme_clusters(text)))
-
-    def copy_selection(self):
-        t = self.selection_text()
-        if t:
-            QApplication.clipboard().setText(t)
-            self.status_hint("已复制到剪贴板")
-
-    def cut_selection(self):
-        if not self._editable_page():
-            return
-        if self.selection_text():
-            QApplication.clipboard().setText(self.selection_text())
-            self._delete_selection()
-
-    def paste(self):
-        if not self._editable_page():
-            return
-        text = QApplication.clipboard().text()
-        if not text:
-            return
-        if "\n" in text:
-            self._paste_multiline(text)
-        elif self.selection is not None:
-            self._replace_selection(text)
+        if sess.selection:
+            sess.cursor = self._session_delete_selection()
         else:
-            self.insert_text(text)
+            sess.cursor = sess.buffer.delete_forward(sess.cursor)
+        self.canvas.refresh_overlays()
 
-    def _paste_multiline(self, text):
-        model = self._model()
-        if model is None or self.cursor is None:
-            self.status_hint("请先在页面文本处单击以定位光标")
+    def _session_delete_selection(self):
+        sess = self.session
+        anchor, focus = sess.selection
+        sess.selection = None
+        return sess.buffer.delete_selection(anchor, focus)
+
+    def session_move(self, delta, word=False, extend=False):
+        sess = self.session
+        if sess is None:
             return
-        lines = text.split("\n")
-        rbs = []
-        if self.selection is not None:
-            segs = self.selection_segments()
-            for k, (line, s, e) in enumerate(segs):
-                rbs.append(executor.make_rebuild(self.page_no, line, s, e,
-                                                 lines[0] if k == 0 else "",
-                                                 self._overflow_strategy))
-            base = segs[-1][0]
-            cur_after = (segs[0][0].bbox, segs[0][1] + n_grapheme_clusters(lines[0]))
+        hl, off = sess.cursor
+        if word:
+            pos = sess.buffer.word_step(sess.cursor, delta > 0)
         else:
-            li, gi = self.cursor
-            line = model.lines[li]
-            rbs.append(executor.make_rebuild(self.page_no, line, gi, gi,
-                                             lines[0], self._overflow_strategy))
-            base = line
-            cur_after = (line.bbox, gi + n_grapheme_clusters(lines[0]))
-        for extra in lines[1:]:
-            nxt = base.index + 1
-            if nxt < len(model.lines):
-                line2 = model.lines[nxt]
-                rbs.append(executor.make_rebuild(
-                    self.page_no, line2, len(line2.glyphs), len(line2.glyphs),
-                    extra, self._overflow_strategy))
-                base = line2
+            hl_lines = sess.buffer.hard_lines
+            if delta > 0:
+                if off < len(hl_lines[hl]):
+                    pos = (hl, off + 1)
+                elif hl < len(hl_lines) - 1:
+                    pos = (hl + 1, 0)
+                else:
+                    pos = sess.cursor
             else:
-                rbs[0].new_text += " " + extra
-                cur_after = (cur_after[0], cur_after[1] + 1 + n_grapheme_clusters(extra))
-        li0, gi0 = self.cursor
-        self._push_text_cmd("粘贴文本", rbs,
-                            (li0, gi0, model.lines[li0].bbox), cur_after)
-        self.status_hint("多行粘贴：已按行原位追加（段落重排属第二阶段）")
+                if off > 0:
+                    pos = (hl, off - 1)
+                elif hl > 0:
+                    pos = (hl - 1, len(hl_lines[hl - 1]))
+                else:
+                    pos = sess.cursor
+        if extend:
+            anchor = sess.selection[0] if sess.selection else sess.cursor
+            sess.selection = (anchor, pos)
+        else:
+            sess.selection = None
+        sess.cursor = pos
+        self.canvas.box_editor.update()
 
-    def apply_style_to_selection(self, size, color):
-        if not self._editable_page():
+    def session_move_vertical(self, dy, extend=False):
+        sess = self.session
+        if sess is None:
             return
-        segs = self.selection_segments()
-        if not segs:
-            self.status_hint("请先选择要修改样式的文本")
+        adv = sess.oracle.adv_fn()
+        x, bl = sess.buffer.cursor_pos(sess.cursor, adv)
+        target = bl + dy * sess.buffer.line_height
+        pos = sess.buffer.hit_test(x, target, adv)
+        if extend:
+            anchor = sess.selection[0] if sess.selection else sess.cursor
+            sess.selection = (anchor, pos)
+        else:
+            sess.selection = None
+        sess.cursor = pos
+        self.canvas.box_editor.update()
+
+    def session_move_edge(self, head, extend=False):
+        sess = self.session
+        if sess is None:
             return
-        rbs = []
-        for line, s, e in segs:
-            rb = executor.make_rebuild(self.page_no, line, s, e, "",
-                                       self._overflow_strategy)
-            rb.keep_positions = True
-            rb.style_delta = {"size": size, "color": color}
-            rbs.append(rb)
-        cmd = TextStyleCommand(self.page_no, rbs)
-        cmd.edit_rects = [rb.redact_rect for rb in rbs]
-        cmd.cursor_after = (segs[0][0].bbox, segs[0][1])
-        self._exec_cmd(cmd)
+        hl, off = sess.cursor
+        pos = (hl, 0 if head else len(sess.buffer.hard_lines[hl]))
+        if extend:
+            anchor = sess.selection[0] if sess.selection else sess.cursor
+            sess.selection = (anchor, pos)
+        else:
+            sess.selection = None
+        sess.cursor = pos
+        self.canvas.box_editor.update()
 
-    def _push_text_cmd(self, title, rebuilds, cursor_before, cursor_after):
-        cmd = TextEditCommand(title, self.page_no, rebuilds,
-                              cursor_before, cursor_after)
-        cmd.edit_rects = [rb.redact_rect for rb in rebuilds]
-        self._exec_cmd(cmd)
+    def session_cursor_pos(self):
+        sess = self.session
+        if sess is None:
+            return (0, 0)
+        return sess.buffer.cursor_pos(sess.cursor, sess.oracle.adv_fn())
 
-    # ================================================== 图片编辑
-    def image_at(self, x, y):
-        model = self._model()
-        if model is None:
-            return None
-        for img in reversed(model.images):
-            if img.rect[0] <= x <= img.rect[2] and img.rect[1] <= y <= img.rect[3]:
-                return img
+    def session_set_preedit(self, text):
+        sess = self.session
+        if sess is None:
+            return
+        sess.preedit = text or ""
+        self.canvas.box_editor.update()
+
+    def session_preedit_clear(self):
+        if self.session is not None:
+            self.session.preedit = ""
+            self.canvas.box_editor.update()
+
+    def current_style(self):
+        sess = self.session
+        if sess is not None:
+            return sess.buffer.style_at(sess.cursor)
+        if self.selected_block is not None:
+            return self.selected_block.dominant_style()
         return None
 
-    def selected_image(self):
-        return self._sel_image
-
-    def select_image(self, img):
-        self._sel_image = img
-        self.canvas._refresh_handles()
-        self.status_hint(f"已选择图片（可拖动/缩放/旋转；Delete 删除）")
-
-    def deselect_image(self):
-        self._sel_image = None
-        self.canvas._refresh_handles()
-
-    def commit_image_transform(self, d):
-        if not self._editable_page() or self._sel_image is None:
+    # ================================================== 剪贴板
+    def copy(self):
+        sess = self.session
+        if sess is None:
+            if self.selected_block is not None:
+                t = self.selected_block.text()
+                if t:
+                    QApplication.clipboard().setText(t)
+                    self.status_hint("已复制选中文本框内容")
             return
-        img = self._sel_image
-        blob = executor.image_blob(self.doc, img.xref)
+        if sess.selection:
+            t = sess.buffer.selection_text(*sess.selection)
+            if t:
+                QApplication.clipboard().setText(t)
+
+    def cut(self):
+        sess = self.session
+        if sess is None or not sess.selection:
+            return
+        t = sess.buffer.selection_text(*sess.selection)
+        if t:
+            QApplication.clipboard().setText(t)
+            sess.cursor = self._session_delete_selection()
+            self.canvas.refresh_overlays()
+
+    def paste(self):
+        sess = self.session
+        if sess is None:
+            self.status_hint("请先双击进入文本框编辑")
+            return
+        text = QApplication.clipboard().text()
+        if text:
+            self.session_insert(text)
+
+    # ================================================== 文本框变换（移动/调宽）
+    def commit_block_transform(self, block, dx, dy, dw, title):
+        if not self._editable():
+            return
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        buffer = BoxBuffer(block)
+        oracle = FontOracle(self.resolver, page)
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            buffer.translate(dx, dy)
+        if abs(dw) > 0.5:
+            buffer.set_width(buffer.width + dw)
+        executor.remove_text_region(page, _expand(block.bbox, 0.6))
+        runs = buffer.commit_runs(oracle)
+        executor.insert_runs(page, runs, self.resolver)
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand(title, self.page_no, before, after)
+        cmd.edit_rects = [_expand(block.bbox, 1.0), buffer.bbox()]
+        self._register_cmd(cmd, buffer, runs)
+
+    def delete_selected_block(self):
+        if not self._editable() or self.selected_block is None:
+            return
+        block = self.selected_block
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        executor.remove_text_region(page, _expand(block.bbox, 0.6))
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand("删除文本框内容", self.page_no, before, after)
+        cmd.edit_rects = [_expand(block.bbox, 1.0)]
+        self.deselect_all()
+        self._register_cmd(cmd)
+        self.status_hint("文本框内容已删除（可撤销）")
+
+    # ================================================== 图片操作
+    def commit_image_transform(self, old_rect, old_deg, new_rect, new_deg, title):
+        if not self._editable():
+            return
+        page = self.current_page()
+        blob = None
+        img = self.selected_image
+        if img is not None:
+            blob = executor.image_blob(self.doc, img.xref)
         if not blob:
             self.status_hint("无法提取图片数据")
             return
-        before = ImageState(tuple(img.rect), d.get("old_deg", 0.0), blob)
-        after = ImageState(tuple(d["new_rect"]), d.get("new_deg", 0.0), blob)
-        cmd = ImageTransformCommand(d.get("title", "调整图片"),
-                                    self.page_no, before, after)
-        cmd.edit_rects = [tuple(img.rect), tuple(d["new_rect"])]
-        self._exec_cmd(cmd, reselect_rect=d["new_rect"])
+        before = capture_page_state(self.doc, page)
+        executor.place_image(self.doc, page, [old_rect], new_rect, new_deg, blob)
+        page = self.current_page()  # place_image 内部 reload，需重新获取
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand(title, self.page_no, before, after)
+        cmd.edit_rects = [old_rect, new_rect]
+        self._register_cmd(cmd)
+        # 重新选中新位置的图片
+        model = self._model()
+        best, best_v = None, 0.0
+        for im in (model.images if model else []):
+            v = _rect_iou(im.rect, new_rect)
+            if v > best_v:
+                best_v, best = v, im
+        if best is not None and best_v > 0.7:
+            self.selected_image = best
+        self.canvas.refresh_overlays()
 
     def delete_selected_image(self):
-        if not self._editable_page() or self._sel_image is None:
+        if not self._editable() or self.selected_image is None:
             return
-        img = self._sel_image
-        blob = executor.image_blob(self.doc, img.xref)
-        cmd = ImageDeleteCommand(self.page_no,
-                                 ImageState(tuple(img.rect), img.deg, blob))
-        cmd.edit_rects = [tuple(img.rect)]
-        self._exec_cmd(cmd)
-        self.status_hint("图片已删除（内容流移除，可撤销）")
+        img = self.selected_image
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        executor.place_image(self.doc, page, [img.rect], None, 0, b"")
+        page = self.current_page()  # reload 后重新获取
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand("删除图片", self.page_no, before, after)
+        cmd.edit_rects = [img.rect]
+        self.deselect_all()
+        self._register_cmd(cmd)
+        self.status_hint("图片已删除（可撤销）")
 
     def replace_selected_image(self):
-        if not self._editable_page() or self._sel_image is None:
+        if not self._editable() or self.selected_image is None:
             return
-        img = self._sel_image
+        img = self.selected_image
         path, _ = QFileDialog.getOpenFileName(
             self, "选择替换图片", "", "图片 (*.png *.jpg *.jpeg *.bmp)")
         if not path:
@@ -779,111 +792,83 @@ class MainWindow(QMainWindow):
             self.status_hint("无法提取原图数据")
             return
         cmd = ImageReplaceCommand(self.page_no, img.xref, old_blob, new_blob)
-        cmd.edit_rects = [tuple(img.rect)]
-        self._exec_cmd(cmd, reselect_rect=tuple(img.rect))
-        self.status_hint("图片内容已替换（位置与变换保持不变）")
+        cmd.edit_rects = [img.rect]
+        self.undo_stack.push(cmd, self.ctx)
+        self.edit_regions.setdefault(self.page_no, []).append(tuple(img.rect))
+        self._refresh_page()
+        self.status_hint("图片内容已替换（位置与变换不变）")
 
-    # ================================================== 命令执行与刷新
-    def _exec_cmd(self, cmd, reselect_rect=None):
-        results = self.undo_stack.push(cmd, self.ctx)
-        self._register_results(cmd, results)
-        self._refresh_page(cmd)
-        if reselect_rect is not None:
-            model = self._model()
-            best, best_v = None, 0.0
-            for im in (model.images if model else []):
-                ix0, iy0 = max(im.rect[0], reselect_rect[0]), max(im.rect[1], reselect_rect[1])
-                ix1, iy1 = min(im.rect[2], reselect_rect[2]), min(im.rect[3], reselect_rect[3])
-                if ix1 > ix0 and iy1 > iy0:
-                    inter = (ix1 - ix0) * (iy1 - iy0)
-                    a1 = (im.rect[2] - im.rect[0]) * (im.rect[3] - im.rect[1])
-                    a2 = (reselect_rect[2] - reselect_rect[0]) * (reselect_rect[3] - reselect_rect[1])
-                    v = inter / max(a1 + a2 - inter, 1e-6)
-                    if v > best_v:
-                        best_v, best = v, im
-            if best is not None and best_v > 0.7:
-                self._sel_image = best
-                self.canvas._refresh_handles()
-        self._update_panels()
+    # ================================================== 撤销/重做
+    def undo(self):
+        if self.doc is None:
+            return
+        if self.session is not None:
+            self.cancel_session()
+            return
+        r = self.undo_stack.undo(self.ctx)
+        if not r:
+            return
+        cmd, _ = r
+        for rect in getattr(cmd, "edit_rects", []) or []:
+            self.edit_regions.setdefault(self.page_no, []).append(tuple(rect))
+        self.deselect_all()
+        self._refresh_page()
+        self.status_hint(f"已撤销：{cmd.title}（页面字节级恢复）")
 
-    def _register_results(self, cmd, results):
-        fid = self.fidelities.setdefault(self.page_no, PageFidelity())
+    def redo(self):
+        if self.doc is None or self.session is not None:
+            return
+        r = self.undo_stack.redo(self.ctx)
+        if not r:
+            return
+        cmd, _ = r
+        for rect in getattr(cmd, "edit_rects", []) or []:
+            self.edit_regions.setdefault(self.page_no, []).append(tuple(rect))
+        self.deselect_all()
+        self._refresh_page()
+
+    # ================================================== 刷新
+    def _refresh_render_only(self):
+        """仅重渲染页面位图（会话开始/编辑中用，模型不变）。"""
+        if self.doc is None:
+            return
+        page = self.current_page()
+        pm = self._render_qpixmap(page)
         model = self._model()
-        if model is not None and model.scanned:
-            fid.level = "red"
-            if model.scanned_note not in fid.reasons:
-                fid.reasons.append(model.scanned_note)
-        if results:
-            fid.update(results)
-        for r in getattr(cmd, "edit_rects", []) or []:
-            self.edit_regions.setdefault(self.page_no, []).append(tuple(r))
+        self.canvas.zoom = self.zoom
+        self.canvas.set_page_content(pm, model,
+                                     model.rect[2], model.rect[3])
+        self.canvas.apply_zoom()
 
-    def _refresh_page(self, cmd=None):
+    def _refresh_page(self):
         if self.doc is None:
             return
         page = self.doc[self.page_no]
         model = extract_page(page, self.page_no)
         self.models[self.page_no] = model
-        self.selection = None
-        spec = getattr(cmd, "cursor_after", None) if cmd is not None else None
-        if spec is not None:
-            bbox, gi = spec
-            li = find_line_by_bbox(model, bbox)
-            if li >= 0:
-                self.cursor = (li, max(0, min(gi, len(model.lines[li].glyphs))))
-        else:
-            self.cursor = None
         pm = self._render_qpixmap(page)
         self.canvas.zoom = self.zoom
         self.canvas.set_page_content(pm, model, model.rect[2], model.rect[3])
         self.canvas.apply_zoom()
-        self.canvas.update_cursor_item()
-        self.canvas.update_selection_items()
-        if self._sel_image is None:
-            self.canvas._refresh_handles()
+        self.canvas.refresh_overlays()
         self._update_thumb(self.page_no)
-
-    def undo(self):
-        if self.doc is None:
-            return
-        r = self.undo_stack.undo(self.ctx)
-        if not r:
-            return
-        cmd, results = r
-        self._register_results(cmd, results)
-        self._refresh_page()
-        cb = getattr(cmd, "cursor_before", None)
-        if cb is not None:
-            li0, gi0, bbox = cb
-            model = self._model()
-            li = find_line_by_bbox(model, bbox)
-            if li >= 0:
-                self.cursor = (li, max(0, min(gi0, len(model.lines[li].glyphs))))
-                self.canvas.update_cursor_item()
-        self._update_panels()
-
-    def redo(self):
-        if self.doc is None:
-            return
-        r = self.undo_stack.redo(self.ctx)
-        if not r:
-            return
-        cmd, results = r
-        self._register_results(cmd, results)
-        self._refresh_page(cmd)
         self._update_panels()
 
     # ================================================== 保存与验证
     def save(self):
         if self.doc is None:
             return
+        if self.session is not None:
+            self.commit_session()
         self._do_save(self.doc_path)
 
     def save_as(self):
         if self.doc is None:
             return
+        if self.session is not None:
+            self.commit_session()
         path, _ = QFileDialog.getSaveFileName(self, "另存为", self.doc_path,
-                                               "PDF 文件 (*.pdf)")
+                                              "PDF 文件 (*.pdf)")
         if path:
             if self._do_save(path):
                 self.doc_path = path
@@ -908,9 +893,10 @@ class MainWindow(QMainWindow):
         return True
 
     def save_optimized(self):
-        """导出字体子集化优化副本（不影响当前可撤销文档）。"""
         if self.doc is None:
             return
+        if self.session is not None:
+            self.commit_session()
         path, _ = QFileDialog.getSaveFileName(
             self, "导出优化副本", self.doc_path.replace(".pdf", "_opt.pdf"),
             "PDF 文件 (*.pdf)")
@@ -933,9 +919,10 @@ class MainWindow(QMainWindow):
                                  "当前编辑会话不受影响）")
 
     def reverify(self):
-        """对当前状态做临时保存 + 验证（不写盘）。"""
         if self.doc is None:
             return
+        if self.session is not None:
+            self.commit_session()
         fd, tmp = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         try:
@@ -956,12 +943,8 @@ class MainWindow(QMainWindow):
         self.lb_zoom.setText(f"{z * 100:.0f}%")
         if self.doc is None:
             return
-        page = self.doc[self.page_no]
-        pm = self._render_qpixmap(page)
-        self.canvas.zoom = z
-        self.canvas.set_page_content(pm, self._model(),
-                                     page.rect.width, page.rect.height)
-        self.canvas.apply_zoom()
+        self._refresh_render_only()
+        self.canvas.refresh_overlays()
 
     def fit_width(self):
         if self.doc is None:
@@ -973,26 +956,21 @@ class MainWindow(QMainWindow):
     def _on_hover(self, x, y):
         self.lb_pos.setText(f"({x:.1f}, {y:.1f})")
 
-    # ================================================== 状态与面板
-    def _set_overflow(self, s):
-        self._overflow_strategy = s
-
     def status_hint(self, msg):
         self.statusBar().showMessage(msg, 6000)
 
-    def _update_canvas_overlays(self):
-        self.canvas.update_cursor_item()
-        self.canvas.update_selection_items()
-        self._update_sel_stats()
-        self._update_panels()
-
-    def _update_sel_stats(self):
-        segs = self.selection_segments()
-        n_chars = sum(e - s for (_l, s, e) in segs)
-        self.panel.update_selection(n_chars, len(segs))
-
     def _update_panels(self):
         self.panel.update_style(self.current_style())
+        sess = self.session
+        if sess is not None:
+            n = sess.buffer.char_count()
+            sel = 0
+            if sess.selection:
+                for (hi, s, e) in sess.buffer.selection_range(*sess.selection):
+                    sel += e - s
+            self.panel.update_selection(sel, n)
+        else:
+            self.panel.update_selection(0, 0)
         fid = self.fidelities.get(self.page_no)
         if fid is not None:
             self.lb_fid.setText(LABELS.get(fid.level, fid.level))
@@ -1026,31 +1004,43 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "保真等级说明",
             "绿色 原生编辑：原字体、原布局完整保留。\n\n"
-            "黄色 局部重建：相同或近似字体重建，可能有细微差异（如字号适配、字体替代）。\n\n"
+            "黄色 局部重建：相同或近似字体重建（字体替代、自动换行重排）。\n\n"
             "橙色 覆盖编辑：文本超出原区域或覆盖实现。\n\n"
-            "红色 图像/OCR 编辑：页面为扫描件图像。\n\n"
-            "文本溢出时可选：自动缩小字号 / 保持字号并提示。")
+            "红色 图像/OCR 编辑：页面为扫描件图像。")
 
     def show_about(self):
         QMessageBox.about(
             self, "关于",
-            "<b>PDF 无感编辑器（第一阶段 MVP）</b><br><br>"
-            "架构：PDF 解析重建 + 视觉编辑层 + 局部内容流重写。<br>"
-            "编辑直接修改内容流（真删除，非遮盖），保存后自动执行"
-            "结构校验与视觉回归验证。<br><br>"
-            "已支持：字符级提取、光标/选区/双击选词、输入法、原样式继承、"
-            "原位文本编辑、图片移动/缩放/旋转/替换/删除、撤销重做、字体嵌入、"
-            "保真等级指示。<br><br>"
-            "第二阶段（段落重排、表格语义、竖排/BiDi）与第三阶段（扫描件 OCR 编辑）"
-            "见技术方案路线图。")
+            "<b>PDF 无感编辑器（文本框编辑版）</b><br><br>"
+            "类 PPT 交互：单击选中文本框（拖动/调宽），双击进入框内编辑；"
+            "图片拖动/缩放/旋转。<br>"
+            "编辑直接修改内容流（真删除，非遮盖）；撤销为<b>页面快照字节级恢复</b>，"
+            "可回到原版 PDF；保存后自动执行结构校验与视觉回归验证。")
 
     def closeEvent(self, e):
+        if self.session is not None:
+            self.commit_session()
         if self.doc is not None and self.undo_stack.can_undo:
             ret = QMessageBox.question(
-                self, "未保存的修改",
-                "存在未保存的修改，确定退出吗？",
+                self, "未保存的修改", "存在未保存的修改，确定退出吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if ret != QMessageBox.StandardButton.Yes:
                 e.ignore()
                 return
         super().closeEvent(e)
+
+
+# ---------------------------------------------------------------- 工具函数
+
+def _expand(rect, m):
+    return (rect[0] - m, rect[1] - m, rect[2] + m, rect[3] + m)
+
+
+def _rect_iou(a, b):
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    ua = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / ua if ua > 0 else 0.0

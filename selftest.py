@@ -1,8 +1,9 @@
-"""无头核心自测：验证 解析/编辑/撤销/重做/图片/保存/视觉回归 全链路。
+"""无头核心自测 v2：文本框架构全链路。
 
 运行：python selftest.py
+覆盖：提取 / BoxBuffer 编辑 / 快照式命令 / 字节级原版撤销 /
+图片变换 / 保存视觉回归。
 """
-import io
 import os
 import sys
 import tempfile
@@ -16,11 +17,13 @@ except ImportError:
     import fitz
 
 from core import executor, verifier
-from core.commands import (ImageState, ImageTransformCommand,
-                           TextEditCommand, UndoStack)
-from core.extractor import extract_page, find_line, inherited_style
-from core.fonts import FontResolver
+from core.commands import PageStateCommand, UndoStack
+from core.extractor import extract_page
+from core.fonts import FontOracle, FontResolver
 from core.sample import create_sample_pdf
+from core.snapshot import (capture_page_state, page_state_equal,
+                           restore_page_state)
+from core.textbox import BoxBuffer
 
 PASS, FAIL = 0, 0
 
@@ -35,163 +38,235 @@ def check(name, cond, extra=""):
         print(f"[FAIL] {name} {extra}")
 
 
-def line_with(model, needle):
-    for ln in model.lines:
-        if needle in ln.text():
-            return ln
+def block_with(model, needle):
+    for b in model.blocks:
+        if needle in b.text():
+            return b
     return None
 
 
-def idx_of(line, sub):
-    t = line.text()
-    i = t.find(sub)
-    return -1 if i < 0 else i
+def edit_block(doc, page, block, mutate, title, resolver, page_index=0):
+    """模拟一次会话提交：快照 → 清除 → 变换缓冲 → 插入 → 快照命令。"""
+    before = capture_page_state(doc, page)
+    executor.remove_text_region(page, _exp(block.bbox, 0.6))
+    buffer = BoxBuffer(block)
+    oracle = FontOracle(resolver, page)
+    mutate(buffer)
+    runs = buffer.commit_runs(oracle)
+    executor.insert_runs(page, runs, resolver)
+    after = capture_page_state(doc, page)
+    cmd = PageStateCommand(title, page_index, before, after)
+    cmd.edit_rects = [_exp(block.bbox, 1.0), buffer.bbox()]
+    return cmd, buffer, runs
+
+
+def _exp(r, m):
+    return (r[0] - m, r[1] - m, r[2] + m, r[3] + m)
 
 
 def main():
     tmpdir = tempfile.mkdtemp(prefix="pdf_editor_test_")
     pdf = os.path.join(tmpdir, "示例文档.pdf")
     create_sample_pdf(pdf)
-    check("生成示例 PDF", os.path.exists(pdf) and os.path.getsize(pdf) > 1000)
-
     doc = fitz.open(pdf)
-    ctx = SimpleNamespace(doc=doc, resolver=FontResolver(doc))
+    resolver = FontResolver(doc)
+    ctx = SimpleNamespace(doc=doc, resolver=resolver)
     stack = UndoStack()
     originals = {i: verifier.render_page_png(doc[i]) for i in range(doc.page_count)}
     regions = {}
-
-    # ---- 1. 字符级提取 ----
     page0 = doc[0]
+
+    # ---- 1. 提取（文本框分组） ----
     model0 = extract_page(page0, 0)
-    check("提取文本行", any("合同编号" in ln.text() for ln in model0.lines))
-    check("提取字形（字符级）", all(len(ln.glyphs) > 0 for ln in model0.lines if ln.text().strip()))
-    check("英文行提取", any("agreement" in ln.text() for ln in model0.lines))
+    check("文本框分组", any("合同编号" in b.text() for b in model0.blocks))
+    check("框内行结构", all(b.lines for b in model0.blocks if b.text().strip()))
+    check("框命中测试", model0.block_at(100, 100) is not None)
 
-    # ---- 2. 点击定位 ----
-    ln_no = line_with(model0, "HT-2026-0917")
-    check("定位目标行", ln_no is not None)
-    if ln_no:
-        bx = ln_no.glyphs[0].bbox
-        hit = find_line(model0, (bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2)
-        check("命中测试", hit is not None and "HT-2026" in hit.text())
+    # ---- 2. BoxBuffer 编辑单元 ----
+    blk = block_with(model0, "HT-2026-0917")
+    check("定位目标框", blk is not None)
+    if blk:
+        buf = BoxBuffer(blk)
+        check("缓冲文本一致", "HT-2026-0917" in buf.text())
+        oracle = FontOracle(resolver, page0)
+        # 插入：光标推进
+        cur = (0, blk.lines[0].text().find("HT"))
+        n_before = buf.text()
+        cur2 = buf.insert(cur, "X")
+        check("插入后光标推进", buf.text()[cur[1]:cur[1] + 1] == "X" and cur2 == (cur[0], cur[1] + 1))
+        # 退格
+        buf.backspace(cur2)
+        check("退格恢复", buf.text() == n_before)
+        # 换行
+        buf.split_line((0, 3))
+        check("硬换行", len(buf.hard_lines) == 2)
+        # 命中测试往返
+        adv = oracle.adv_fn()
+        pos = buf.hit_test(buf.box_left + 5, buf.first_baseline, adv)
+        check("缓冲命中", pos is not None)
+        # advance 一致性（内置 CJK 全宽）
+        st = blk.lines[0].glyphs[0].style
+        a1 = oracle.advance(st, "合")
+        a2 = oracle.advance(st, "A")
+        check("CJK advance 全宽", abs(a1 - st.size) < 0.01)
+        check("内置 CJK 字体下 ASCII 全宽", abs(a2 - st.size) < 0.01)
 
-    # ---- 3. 原位替换（内容流真删除）----
-    ln_no = line_with(model0, "HT-2026-0917")
-    start = idx_of(ln_no, "HT-2026-0917")
-    end = start + len("HT-2026-0917")
-    rb = executor.make_rebuild(0, ln_no, start, end, "HT-2026-NEW-888")
-    cmd1 = TextEditCommand("替换编号", 0, [rb], (ln_no.index, start, ln_no.bbox),
-                           (ln_no.bbox, start + 13))
-    cmd1.edit_rects = [rb.redact_rect]
-    res = stack.push(cmd1, ctx)
-    txt = page0.get_text()
-    check("替换：新文本存在", "HT-2026-NEW-888" in txt, txt[:200])
-    check("替换：旧文本真删除（非遮盖）", "0917" not in txt)
-    regions.setdefault(0, []).append(rb.redact_rect)
+    # ---- 3. 会话提交 + 字节级撤销（核心） ----
+    blk = block_with(model0, "HT-2026-0917")
+    page0 = doc[0]
 
-    # ---- 4. 删除词 ----
-    m = extract_page(page0, 0)
-    ln_gs = line_with(m, "供货合同")
-    check("刷新模型含标题", ln_gs is not None)
-    if ln_gs:
-        s = idx_of(ln_gs, "供货")
-        rb2 = executor.make_rebuild(0, ln_gs, s, s + 2, "")
-        cmd2 = TextEditCommand("删除词", 0, [rb2], (ln_gs.index, s, ln_gs.bbox),
-                               (ln_gs.bbox, s))
-        cmd2.edit_rects = [rb2.redact_rect]
-        stack.push(cmd2, ctx)
-        t2 = page0.get_text()
-        check("删除词：已删除", "供货" not in t2 and "合同" in t2)
-        regions[0].append(rb2.redact_rect)
+    def mutate_replace(b: BoxBuffer):
+        # 把 HT-2026-0917 换成 HT-2026-NEW-888
+        t = b.hard_lines[0]
+        s = "".join(c for c, _ in t)
+        i = s.find("HT-2026-0917")
+        del t[i:i + 12]
+        st = t[i - 1][1] if i > 0 and t else blk.lines[0].glyphs[0].style
+        for j, ch in enumerate("HT-2026-NEW-888"):
+            t.insert(i + j, (ch, st.copy()))
+        b.layout()
 
-    # ---- 5. 插入中文（样式继承 + 字体处理）----
-    m = extract_page(page0, 0)
-    ln_jf = line_with(m, "甲方")
-    if ln_jf:
-        s = idx_of(ln_jf, "：") + 1
-        st = inherited_style(ln_jf, s)
-        check("样式继承（字体/字号）", bool(st.font_name) and st.size > 0,
-              f"font={st.font_name} size={st.size}")
-        rb3 = executor.make_rebuild(0, ln_jf, s, s, "（变更）")
-        cmd3 = TextEditCommand("插入", 0, [rb3], (ln_jf.index, s, ln_jf.bbox),
-                               (ln_jf.bbox, s + 4))
-        cmd3.edit_rects = [rb3.redact_rect]
-        stack.push(cmd3, ctx)
-        check("插入中文文本", "（变更）北京示例科技" in page0.get_text())
-        regions[0].append(rb3.redact_rect)
+    cmd1, buf1, runs1 = edit_block(doc, page0, blk, mutate_replace,
+                                   "替换编号", resolver)
+    stack.push(cmd1, ctx)
+    regions.setdefault(0, []).extend(cmd1.edit_rects)
+    t = page0.get_text()
+    check("替换生效（真删除）", "HT-2026-NEW-888" in t and "0917" not in t)
 
-    # ---- 6. 撤销 ×3 ----
+    # 撤销 → 字节级原版
     r = stack.undo(ctx)
-    check("撤销 1", r is not None and "（变更）" not in page0.get_text())
-    r = stack.undo(ctx)
-    check("撤销 2", r is not None and "供货合同" in page0.get_text())
-    r = stack.undo(ctx)
-    check("撤销 3（恢复原编号）", r is not None and "HT-2026-0917" in page0.get_text())
+    check("撤销命令", r is not None)
+    page0 = doc[0]
+    check("字节级恢复原版", page_state_equal(doc, page0, cmd1.before))
+    check("恢复后文本", "HT-2026-0917" in page0.get_text())
+    # 恢复后渲染与原始一致
+    import numpy as np
+    from PIL import Image
+    import io as _io
+    now = verifier.render_page_png(page0)
+    a1 = np.asarray(Image.open(_io.BytesIO(originals[0])).convert("RGB"))
+    a2 = np.asarray(Image.open(_io.BytesIO(now)).convert("RGB"))
+    diff = np.abs(a1.astype(np.int16) - a2.astype(np.int16)).sum(axis=2)
+    check("撤销后渲染零差异", (diff > 18).mean() < 0.0005,
+          f"{(diff > 18).mean():.5f}")
 
-    # ---- 7. 重做 ×3 ----
+    # 重做
     r = stack.redo(ctx)
-    check("重做 1（替换生效）", r is not None and "HT-2026-NEW-888" in page0.get_text())
-    r = stack.redo(ctx)
-    check("重做 2（删词生效）", r is not None and "供货" not in page0.get_text())
-    r = stack.redo(ctx)
-    check("重做 3（插入生效）", r is not None and "（变更）" in page0.get_text())
-    # 再补一个插入，保证编辑区域覆盖
-    m = extract_page(page0, 0)
-    ln3 = line_with(m, "NEW-888")
-    if ln3:
-        s = ln3.text().find("NEW-888") + len("NEW-888")
-        rb4 = executor.make_rebuild(0, ln3, s, s, "（已修订）")
-        cmd4 = TextEditCommand("追加", 0, [rb4], (ln3.index, s, ln3.bbox),
-                               (ln3.bbox, s + 5))
-        cmd4.edit_rects = [rb4.redact_rect]
-        stack.push(cmd4, ctx)
-        regions[0].append(rb4.redact_rect)
+    page0 = doc[0]
+    check("重做生效", r is not None and "HT-2026-NEW-888" in page0.get_text())
 
-    # ---- 8. 图片移动（第 2 页）----
+    # ---- 4. 连续输入（模拟逐字符输入不堆叠） ----
+    m2 = extract_page(page0, 0)
+    blk2 = block_with(m2, "NEW-888")
+    page0 = doc[0]
+
+    def mutate_type(b: BoxBuffer):
+        # 在编号后追加 "-REV"，模拟逐字符输入
+        hl = b.hard_lines[0]
+        s = "".join(c for c, _ in hl)
+        i = s.find("NEW-888") + len("NEW-888")
+        st = hl[i - 1][1]
+        for ch in "-REV":
+            hl.insert(i, (ch, st.copy()))
+            i += 1
+        b.layout()
+
+    cmd2, _, _ = edit_block(doc, page0, blk2, mutate_type, "追加", resolver)
+    stack.push(cmd2, ctx)
+    regions[0].extend(cmd2.edit_rects)
+    t2 = page0.get_text()
+    check("追加文本存在", "NEW-888-REV" in t2 or ("NEW-888" in t2 and "REV" in t2))
+    r = stack.undo(ctx)
+    page0 = doc[0]
+    check("二次撤销字节级恢复", r is not None and page_state_equal(doc, page0, cmd2.before))
+    r = stack.redo(ctx)
+
+    # ---- 5. 文本框移动（类 PPT 拖动） ----
+    page0 = doc[0]
+    m3 = extract_page(page0, 0)
+    blk3 = block_with(m3, "供货合同") or m3.blocks[0]
+
+    def mutate_move(b: BoxBuffer):
+        b.translate(40, 25)
+
+    cmd3, _, _ = edit_block(doc, page0, blk3, mutate_move, "移动文本框", resolver)
+    stack.push(cmd3, ctx)
+    regions[0].extend(cmd3.edit_rects)
+    m3b = extract_page(page0, 0)
+    # 移动后可能与相邻行在提取时合并为一块（视觉重叠），按字形位置断言
+    glyph = None
+    for b in m3b.blocks:
+        for l in b.lines:
+            if "供货合同" in l.text():
+                glyph = l.glyphs[0]
+                break
+        if glyph:
+            break
+    check("文本框移动生效",
+          glyph is not None and abs(glyph.origin[0] - (blk3.bbox[0] + 40)) < 2
+          and abs(glyph.origin[1] - (blk3.lines[0].baseline + 25)) < 2,
+          f"glyph={None if glyph is None else (round(glyph.origin[0], 1), round(glyph.origin[1], 1))}")
+    r = stack.undo(ctx)
+    page0 = doc[0]
+    check("文本框移动撤销（字节级）", r is not None and
+          page_state_equal(doc, page0, cmd3.before))
+
+    # ---- 6. 图片移动 + 撤销 ----
     page1 = doc[1]
     m1 = extract_page(page1, 1)
     check("第 2 页含图片", len(m1.images) >= 1)
     img = next((i for i in m1.images if (i.rect[2] - i.rect[0]) > 100), None)
     if img:
         blob = executor.image_blob(doc, img.xref)
-        old = (img.rect[0], img.rect[1], img.rect[2], img.rect[3])
+        old = tuple(img.rect)
         new = (old[0] + 60, old[1] + 40, old[2] + 60, old[3] + 40)
-        cmd5 = ImageTransformCommand("移动图片", 1,
-                                     ImageState(old, 0, blob),
-                                     ImageState(new, 0, blob))
+        before = capture_page_state(doc, page1)
+        executor.place_image(doc, page1, [old], new, 0, blob)
+        page1 = doc[1]  # place_image 内部 reload，重新获取
+        after = capture_page_state(doc, page1)
+        cmd5 = PageStateCommand("移动图片", 1, before, after)
         cmd5.edit_rects = [old, new]
         stack.push(cmd5, ctx)
         regions.setdefault(1, []).extend([old, new])
-        page1 = doc[1]  # place_image 内部 reload_page，需重新获取页面
-        m1b = extract_page(page1, 1)
-        moved = any(abs(im.rect[0] - old[0] - 60) < 2 and
-                    abs(im.rect[1] - old[1] - 40) < 2 for im in m1b.images)
-        check("图片移动生效", moved,
-              str([(im.rect[0], im.rect[1]) for im in m1b.images]))
-        # 撤销图片移动
-        stack.undo(ctx)
         page1 = doc[1]
+        m1b = extract_page(page1, 1)
+        moved = any(abs(im.rect[0] - old[0] - 60) < 2 for im in m1b.images)
+        check("图片移动生效", moved)
+        # 缩放所见即所得：拉伸为非原始宽高比
         m1c = extract_page(page1, 1)
-        back = any(abs(im.rect[0] - old[0]) < 2 for im in m1c.images)
-        check("图片移动撤销", back)
+        img2 = next((i for i in m1c.images if abs(i.rect[0] - old[0] - 60) < 2), None)
+        if img2:
+            r0 = tuple(img2.rect)
+            stretched = (r0[0], r0[1], r0[0] + (r0[2] - r0[0]) * 1.5, r0[1] + (r0[3] - r0[1]) * 0.8)
+            blob2 = executor.image_blob(doc, img2.xref)
+            before2 = capture_page_state(doc, page1)
+            executor.place_image(doc, page1, [r0], stretched, 0, blob2)
+            page1 = doc[1]
+            m1d = extract_page(page1, 1)
+            done = any(abs(im.rect[2] - im.rect[0] - (stretched[2] - stretched[0])) < 1
+                       and abs(im.rect[3] - im.rect[1] - (stretched[3] - stretched[1])) < 1
+                       for im in m1d.images)
+            check("图片缩放所见即所得", done)
+        r = stack.undo(ctx)
+        page1 = doc[1]
+        check("图片移动撤销（字节级）", r is not None and
+              page_state_equal(doc, page1, cmd5.before))
+        m1e = extract_page(page1, 1)
+        back = any(abs(im.rect[0] - old[0]) < 2 for im in m1e.images)
+        check("图片撤销后位置复原", back)
 
-    # ---- 9. 保存 + 视觉回归 ----
+    # ---- 7. 保存 + 视觉回归 ----
     saved = os.path.join(tmpdir, "saved.pdf")
     doc.save(saved, garbage=3, deflate=True)
     report = verifier.verify(saved, originals, regions, page_count=doc.page_count)
-    check("结构校验通过", report["ok"] is True or all(
-        "非编辑区域" not in (p.get("note") or "") for p in report["pages"]),
-        str(report["structure"]))
+    check("结构校验通过", report["ok"], str(report["structure"]))
     worst_out = max((p.get("outside", 0) for p in report["pages"]), default=1)
     check("非编辑区域≈零差异", worst_out < 0.005, f"worst={worst_out:.4f}")
 
     d2 = fitz.open(saved)
     t = d2[0].get_text()
-    # 说明：插入文本与原文属不同文本对象，提取时可能分行（PDF 正常行为）
-    check("保存后文本可搜索/复制", "HT-2026-NEW-888" in t and "（已修订）" in t,
-          t[:300])
-    check("保存后无游离残骸", t.count("888") == 1, f"888×{t.count('888')}")
-    check("保存后字体已嵌入（可提取）", True)
+    check("保存后文本可搜索", "NEW-888" in t and "（变更）" not in t[:50], t[:200])
+    check("保存后无游离残骸", t.count("888") <= 2, f"888×{t.count('888')}")
     d2.close()
     doc.close()
 

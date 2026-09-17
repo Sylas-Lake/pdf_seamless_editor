@@ -284,3 +284,73 @@ class FontResolver:
             f = None
         self._sys_cache[path] = f
         return f
+
+
+# ---------------------------------------------------------------- 字体决策器
+
+class FontOracle:
+    """缓冲区编辑的字体决策器：为每个 (样式, 字符) 决定插入字体与 advance。
+
+    规则：优先复用该样式的原始字体（子集覆盖检查）；
+    新增字符若不在子集内，回退到替代字体——保证布局度量与提交渲染一致。
+    """
+
+    def __init__(self, resolver, page):
+        self.resolver = resolver
+        self.page = page
+        self._style_font = {}    # style.key -> ResolvedFont（原始字体）
+        self._char_cache = {}    # (style_key, ch) -> (rf, adv)
+        self._adv_cache = {}     # (rf_key, ch, size) -> float
+
+    def original_font(self, style) -> ResolvedFont:
+        """该样式的原始字体（用该样式已有的一个原字符解析）。"""
+        k = style.key
+        if k in self._style_font:
+            return self._style_font[k]
+        probe = style.font_name or ""
+        rf = self.resolver.resolve(self.page, style, probe or " ")
+        self._style_font[k] = rf
+        return rf
+
+    def char_font(self, style, ch: str) -> ResolvedFont:
+        """单字符的插入字体（原字体覆盖检查 → 替代）。"""
+        k = (style.key, ch)
+        if k in self._char_cache:
+            return self._char_cache[k][0]
+        rf = self.original_font(style)
+        from .fonts import covers
+        if rf is None or rf.font is None or not covers(rf.font, ch):
+            rf = self.resolver.resolve(self.page, style, ch)
+        self._char_cache[k] = (rf, None)
+        return rf
+
+    def advance(self, style, ch: str) -> float:
+        """单字符 advance（与 PDF 渲染一致：内置 CJK 按全宽）。"""
+        k = (style.key, ch)
+        if k in self._char_cache and self._char_cache[k][1] is not None:
+            return self._char_cache[k][1]
+        rf = self.char_font(style, ch)
+        if rf is None or rf.font is None:
+            adv = style.size
+        elif getattr(rf, "key", "") in ("china-t", "china-s", "china-ts",
+                                        "china-ss", "japan", "japan-s",
+                                        "korea", "korea-s"):
+            adv = style.size
+        else:
+            ak = (rf.key, ch, style.size)
+            if ak in self._adv_cache:
+                adv = self._adv_cache[ak]
+            else:
+                try:
+                    adv = rf.font.text_length(ch, style.size)
+                except Exception:
+                    adv = style.size
+                self._adv_cache[ak] = adv
+        self._char_cache[k] = (self.char_font(style, ch), adv)
+        return adv
+
+    def adv_fn(self):
+        """BoxBuffer.layout 用的 advance 回调。"""
+        def fn(ch, st):
+            return self.advance(st, ch)
+        return fn

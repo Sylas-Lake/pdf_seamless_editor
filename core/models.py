@@ -1,22 +1,26 @@
-"""核心数据模型（对应方案文档第三章）。
+"""核心数据模型（v2：文本框编辑架构）。
 
-字符级模型：GlyphNode —— 最小编辑粒度落实到每一个可见字形；
-层级语义模型：TextLine —— 基线、方向接近的一组字符（TextRun/Paragraph/BTextBlock
-在 MVP 中以“同线同样式 Run + 行”近似表达）。
+页面 → 文本框（TextBlock，对应 PDF 文本块）→ 行 → 字形。
+编辑以"文本框"为单元：框内编辑缓冲，提交时整体重建；
+撤销/重做通过页面状态快照字节级恢复。
 """
 from dataclasses import dataclass, field, replace
 
 
 @dataclass
 class TextStyle:
-    """文本样式（继承自原 PDF span，用于新输入文本的样式继承）。"""
-    font_name: str = ""          # 原始 PDF 字体名（可能带子集前缀，如 ABCDEF+SimSun）
-    size: float = 11.0           # 字号（PDF 点）
-    color: tuple = (0.0, 0.0, 0.0)  # RGB，0..1 浮点
-    flags: int = 0               # rawdict span flags（bit1 斜体、bit4 加粗等）
+    """文本样式（继承自原 PDF span，用于样式继承）。"""
+    font_name: str = ""          # 原始 PDF 字体名（可能带子集前缀）
+    size: float = 11.0
+    color: tuple = (0.0, 0.0, 0.0)
+    flags: int = 0
 
     def copy(self) -> "TextStyle":
         return replace(self)
+
+    @property
+    def key(self) -> tuple:
+        return (self.font_name, round(self.size, 3), self.color, self.flags)
 
     @property
     def is_bold(self) -> bool:
@@ -30,20 +34,20 @@ class TextStyle:
 @dataclass
 class GlyphNode:
     """可见字形（grapheme 粒度，组合字符并入前一字符）。"""
-    char: str                    # 完整字素（可含组合符号）
-    bbox: tuple                  # (x0, y0, x1, y1)
-    origin: tuple                # (x, y) 基线起始点
-    style: TextStyle = None      # 所属 span 样式（共享引用）
+    char: str
+    bbox: tuple
+    origin: tuple
+    style: TextStyle = None
 
 
 @dataclass
 class TextLine:
-    """文本行：基线、方向接近的一组字形。"""
-    index: int                   # 页内读取顺序索引
-    bbox: tuple                  # 行包围盒
-    baseline: float              # 主基线 y
+    """文本行（框内）。"""
+    index: int
+    bbox: tuple
+    baseline: float
     glyphs: list = field(default_factory=list)
-    direction: tuple = (1.0, 0.0)  # 行方向 (cos, sin)，非水平行 MVP 不可编辑
+    direction: tuple = (1.0, 0.0)
 
     @property
     def horizontal(self) -> bool:
@@ -54,25 +58,75 @@ class TextLine:
 
 
 @dataclass
+class TextBlock:
+    """文本框：视觉上的一个文本区域（PDF block 推断）。"""
+    index: int
+    bbox: tuple
+    lines: list = field(default_factory=list)   # TextLine 列表
+
+    @property
+    def horizontal(self) -> bool:
+        return all(l.horizontal for l in self.lines) if self.lines else True
+
+    @property
+    def first_baseline(self) -> float:
+        return self.lines[0].baseline if self.lines else self.bbox[3]
+
+    def text(self) -> str:
+        return "\n".join(l.text() for l in self.lines)
+
+    def dominant_style(self) -> TextStyle:
+        """框主样式（最多数字形的样式）。"""
+        stat = {}
+        for l in self.lines:
+            for g in l.glyphs:
+                stat[g.style.key] = stat.get(g.style.key, 0) + 1
+        if not stat:
+            return TextStyle()
+        best = max(stat.items(), key=lambda kv: kv[1])[0]
+        for l in self.lines:
+            for g in l.glyphs:
+                if g.style.key == best:
+                    return g.style.copy()
+        return TextStyle()
+
+
+@dataclass
 class ImageObject:
-    """页面图片对象（含实例位置与放置角度）。"""
+    """页面图片对象。"""
     xref: int
-    rect: tuple                  # (x0, y0, x1, y1)
+    rect: tuple
     width: int = 0
     height: int = 0
-    deg: float = 0.0             # 由放置矩阵推断的旋转角
-
-    def copy(self) -> "ImageObject":
-        return ImageObject(self.xref, self.rect, self.width, self.height, self.deg)
+    deg: float = 0.0
 
 
 @dataclass
 class PageModel:
-    """页面视觉语义模型（可编辑中间文档模型）。"""
+    """页面视觉语义模型。"""
     page_index: int
-    rect: tuple                  # 页面矩形
+    rect: tuple
     rotation: int = 0
-    lines: list = field(default_factory=list)
+    blocks: list = field(default_factory=list)   # TextBlock 列表
     images: list = field(default_factory=list)
-    scanned: bool = False        # 整页图像（扫描件）
+    scanned: bool = False
     scanned_note: str = ""
+
+    def block_at(self, x: float, y: float):
+        """命中测试：返回包含点的最小文本框（无则 None）。"""
+        best, best_area = None, None
+        for b in self.blocks:
+            r = b.bbox
+            if r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                area = (r[2] - r[0]) * (r[3] - r[1])
+                if best_area is None or area < best_area:
+                    best, best_area = b, area
+        return best
+
+    def image_at(self, x: float, y: float):
+        """命中测试：返回包含点的最上层图片（后绘制者优先）。"""
+        for img in reversed(self.images):
+            r = img.rect
+            if r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                return img
+        return None
