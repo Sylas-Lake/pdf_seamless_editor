@@ -3,9 +3,10 @@
 - 单击文本框 → 选中（可拖动/调宽）；双击 → 进入框内编辑
 - 框内编辑：光标/选区/输入法/换行全部基于内存缓冲，实时覆盖层渲染
 - 图片：8 控制点缩放（等比/自由）+ 旋转手柄 + 拖动
-- Ctrl+滚轮缩放
+- Ctrl+滚轮缩放；Shift+滚轮横向平移；滚轮在页边翻页
 """
 import math
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QPainter, QPen)
@@ -306,6 +307,7 @@ class PageCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
         # 事件全部由视图处理，避免 pixmap 吞掉 Windows 的 DblClick
@@ -332,6 +334,8 @@ class PageCanvas(QGraphicsView):
         self._click_count = 0
         self._last_click_ms = 0.0
         self._drag = None  # {kind:"image"|"block", mode, start_rect, cur_rect, deg, corner, start_pos, block}
+        self._pan = None
+        self._last_page_turn = 0.0
 
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(530)
@@ -358,6 +362,23 @@ class PageCanvas(QGraphicsView):
         self.scale(self.zoom, self.zoom)
         self.handle_layer.update()
         self.box_editor.update()
+
+    def center_page(self):
+        def _go():
+            r = self.sceneRect()
+            if r.width() <= 0 or r.height() <= 0:
+                return
+            self.centerOn(r.center())
+        QTimer.singleShot(0, _go)
+
+    def scroll_to_edge(self, edge):
+        def _go():
+            bar = self.verticalScrollBar()
+            if edge == "bottom":
+                bar.setValue(bar.maximum())
+            else:
+                bar.setValue(bar.minimum())
+        QTimer.singleShot(0, _go)
 
     def set_hint(self, text: str):
         self.hint_item.setPlainText(text)
@@ -446,11 +467,8 @@ class PageCanvas(QGraphicsView):
     def mousePressEvent(self, e):
         self._grab_focus()
         if e.button() != Qt.MouseButton.LeftButton:
-            if e.button() == Qt.MouseButton.RightButton and self.controller.selected_image:
-                self._image_menu(e)
             super().mousePressEvent(e)
             return
-        import time
         now = time.monotonic() * 1000
         self._click_count = (self._click_count + 1
                              if now - self._last_click_ms < 450 else 1)
@@ -504,20 +522,38 @@ class PageCanvas(QGraphicsView):
             return
 
         c.deselect_all()
+        self._pan = {
+            "origin": e.position(),
+            "h": self.horizontalScrollBar().value(),
+            "v": self.verticalScrollBar().value(),
+        }
+        self.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
         e.accept()
 
-    def _image_menu(self, e):
+    def contextMenuEvent(self, e):
+        c = self.controller
         m = QMenu(self)
-        m.addAction("替换图片…", self.image_replace_requested.emit)
-        m.addAction("删除图片", self.controller.delete_selected_image)
-        m.addAction("取消选择", lambda: self.controller.deselect_all())
-        gp = e.globalPos()
-        m.exec(int(gp.x()), int(gp.y()))
+        if c.selected_image is not None:
+            m.addAction("替换图片…", self.image_replace_requested.emit)
+            m.addAction("删除图片", c.delete_selected_image)
+            m.addSeparator()
+        m.addAction(c.act_cut)
+        m.addAction(c.act_copy)
+        m.addAction(c.act_paste)
+        m.addAction(c.act_selall)
+        m.exec(e.globalPos())
+        e.accept()
 
     def mouseMoveEvent(self, e):
         sp = self.mapToScene(e.position().toPoint())
         x, y = sp.x(), sp.y()
         self.hover_pos.emit(x, y)
+        if self._pan is not None:
+            delta = e.position() - self._pan["origin"]
+            self.horizontalScrollBar().setValue(int(self._pan["h"] - delta.x()))
+            self.verticalScrollBar().setValue(int(self._pan["v"] - delta.y()))
+            e.accept()
+            return
         if self._drag is not None:
             self._update_drag(sp)
             e.accept()
@@ -544,10 +580,17 @@ class PageCanvas(QGraphicsView):
             self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
         elif c.image_at(x, y) is not None:
             self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        elif self.model is not None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         else:
             self.viewport().unsetCursor()
 
     def mouseReleaseEvent(self, e):
+        if self._pan is not None:
+            self._pan = None
+            self.viewport().unsetCursor()
+            e.accept()
+            return
         if self._drag is not None:
             self._finish_drag()
             e.accept()
@@ -576,13 +619,52 @@ class PageCanvas(QGraphicsView):
         e.accept()
 
     def wheelEvent(self, e):
-        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            d = e.angleDelta().y()
-            if d:
-                self.controller.set_zoom(self.zoom * (1.15 if d > 0 else 1 / 1.15))
+        mods = e.modifiers()
+        dx, dy = self._wheel_delta(e)
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if dy:
+                self.controller.set_zoom(self.zoom * (1.15 if dy > 0 else 1 / 1.15))
             e.accept()
-        else:
-            super().wheelEvent(e)
+            return
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            step = dx if abs(dx) >= abs(dy) else dy
+            if step:
+                bar = self.horizontalScrollBar()
+                bar.setValue(bar.value() - step)
+            e.accept()
+            return
+        if dy:
+            vbar = self.verticalScrollBar()
+            at_top = vbar.value() <= vbar.minimum()
+            at_bottom = vbar.value() >= vbar.maximum()
+            if dy > 0 and at_top and self._try_page_turn(-1, "bottom"):
+                e.accept()
+                return
+            if dy < 0 and at_bottom and self._try_page_turn(1, "top"):
+                e.accept()
+                return
+        super().wheelEvent(e)
+
+    def _wheel_delta(self, e):
+        pix = e.pixelDelta()
+        if not pix.isNull():
+            return pix.x(), pix.y()
+        ang = e.angleDelta()
+        return ang.x(), ang.y()
+
+    def _try_page_turn(self, delta, edge):
+        c = self.controller
+        if c.doc is None:
+            return False
+        nxt = c.page_no + delta
+        if nxt < 0 or nxt >= c.doc.page_count:
+            return False
+        now = time.monotonic()
+        if now - self._last_page_turn < 0.28:
+            return True
+        self._last_page_turn = now
+        c.set_page(nxt, edge=edge)
+        return True
 
     def focusInEvent(self, e):
         super().focusInEvent(e)

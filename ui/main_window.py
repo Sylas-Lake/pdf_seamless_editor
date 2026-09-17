@@ -71,7 +71,7 @@ class StageHost(QWidget):
             return
         self._left_open = on
         self.left.setVisible(on)
-        self._layout_overlay()
+        self._layout_stage(center=True)
         if emit:
             self.left_toggled.emit(on)
 
@@ -81,7 +81,7 @@ class StageHost(QWidget):
             return
         self._right_open = on
         self.right.setVisible(on)
-        self._layout_overlay()
+        self._layout_stage(center=True)
 
     def toggle_left(self):
         self.set_left_open(not self._left_open)
@@ -98,17 +98,21 @@ class StageHost(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.canvas.setGeometry(0, 0, self.width(), self.height())
-        self._layout_overlay()
+        self._layout_stage(center=False)
 
-    def _layout_overlay(self):
+    def _layout_stage(self, center=False):
         w, h = self.width(), self.height()
+        left = self.LEFT_W if self._left_open else 0
+        right = self.RIGHT_W if self._right_open else 0
+        self.canvas.setGeometry(left, 0, max(1, w - left - right), h)
         if self._left_open:
             self.left.setGeometry(0, 0, self.LEFT_W, h)
             self.left.raise_()
         if self._right_open:
             self.right.setGeometry(max(0, w - self.RIGHT_W), 0, self.RIGHT_W, h)
             self.right.raise_()
+        if center:
+            self.canvas.center_page()
 
 
 class ChromeBar(QWidget):
@@ -282,7 +286,6 @@ class MainWindow(QMainWindow):
         self.act_fit = _act("适应宽度", None, self.fit_width, "fit", "适应宽度")
         self.act_prev = _act("上一页", None, lambda: self.set_page(self.page_no - 1), "prev")
         self.act_next = _act("下一页", None, lambda: self.set_page(self.page_no + 1), "next")
-        self.act_sample = _act("生成示例", None, self.make_sample, "sample", "生成示例文档")
         self.act_fid_help = _act("保真等级说明", None, self.show_fidelity_help, "help",
                                 "保真等级说明")
         self.act_about = _act("关于", None, self.show_about, "about", "关于")
@@ -374,9 +377,8 @@ class MainWindow(QMainWindow):
                     self.act_export, self.act_verify):
             self.chrome.add_item(_btn(act))
         self.chrome.add_sep()
-        for act in (self.act_undo, self.act_redo, self.act_cut,
-                    self.act_copy, self.act_paste, self.act_selall):
-            self.chrome.add_item(_btn(act))
+        self.chrome.add_item(_btn(self.act_undo))
+        self.chrome.add_item(_btn(self.act_redo))
         self.chrome.add_sep()
         self.chrome.add_item(_btn(self.act_zoom_out))
         self.lb_zoom = _label("100%", 44)
@@ -390,7 +392,7 @@ class MainWindow(QMainWindow):
         self.chrome.set_pivot(self.lb_page)
         self.chrome.add_item(_btn(self.act_next))
         self.chrome.add_sep()
-        for act in (self.act_sample, self.act_fid_help, self.act_about):
+        for act in (self.act_fid_help, self.act_about):
             self.chrome.add_item(_btn(act))
 
         shell = QWidget()
@@ -469,12 +471,16 @@ class MainWindow(QMainWindow):
     def _model(self):
         return self.models.get(self.page_no)
 
-    def set_page(self, i):
+    def set_page(self, i, *, edge=None):
         if self.doc is None:
             return
         if self.session is not None:
             self.commit_session()
         i = max(0, min(i, self.doc.page_count - 1))
+        if i == self.page_no and self.canvas.model is not None:
+            if edge:
+                self.canvas.scroll_to_edge(edge)
+            return
         self.page_no = i
         self.selected_block = None
         self.selected_image = None
@@ -492,6 +498,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_hint("")
         self.canvas.apply_zoom()
         self.canvas.refresh_overlays()
+        if edge:
+            self.canvas.scroll_to_edge(edge)
         self.lb_page.setText(f"{i + 1} / {self.doc.page_count}")
         self.chrome.relayout()
         self.thumb_list.setCurrentRow(i)
