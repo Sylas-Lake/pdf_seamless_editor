@@ -31,11 +31,6 @@ def main():
 
     if args.demo:
         win.open_file(args.demo)
-    else:
-        sample = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "示例文档.pdf")
-        if os.path.exists(sample):
-            win.open_file(sample)
 
     if args.screenshot:
         def _shot():

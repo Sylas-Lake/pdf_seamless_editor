@@ -15,7 +15,7 @@ try:
 except ImportError:
     import fitz
 
-from PySide6.QtCore import Qt, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -454,9 +454,11 @@ class MainWindow(QMainWindow):
         perm = getattr(fitz, "PDF_PERM_MODIFY", 4)
         self._can_modify = (not doc.is_encrypted) or bool(doc.permissions & perm)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
+        self.zoom = 1.0
+        self.lb_zoom.setText("100%")
+        self.chrome.relayout()
         self.set_page(0)
         self._build_thumbs()
-        QTimer.singleShot(0, self.fit_width)
         self.status_hint("编辑直接修改内容流（真删除，非遮盖）；撤销为字节级原版恢复")
 
     def current_page(self):
