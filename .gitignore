@@ -17,6 +17,7 @@ htmlcov/
 .venv/
 venv/
 env/
+_bootstrap/
 
 # IDE / OS
 .idea/
