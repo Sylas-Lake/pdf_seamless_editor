@@ -1001,7 +1001,19 @@ class MainWindow(QMainWindow):
     def make_sample(self):
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "示例文档.pdf")
-        create_sample_pdf(path)
+        # 当前打开的正是这份文件时，Windows 会锁住无法覆盖
+        if self.doc is not None:
+            try:
+                self.doc.close()
+            except Exception:
+                pass
+            self.doc = None
+            self.doc_path = ""
+        try:
+            create_sample_pdf(path)
+        except Exception as e:
+            QMessageBox.critical(self, "生成失败", f"无法写出示例文档：{e}")
+            return
         self.open_file(path)
 
     def show_fidelity_help(self):
