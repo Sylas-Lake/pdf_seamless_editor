@@ -15,17 +15,18 @@ try:
 except ImportError:
     import fitz
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QAction, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget,
-                               QFileDialog, QInputDialog, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QToolBar)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
+                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QListView, QListWidget, QListWidgetItem,
+                               QMainWindow, QMessageBox, QSizePolicy,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from core import executor, verifier
 from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
 from core.extractor import extract_page
-from core.fidelity import COLORS, LABELS, PageFidelity, worse
+from core.fidelity import PageFidelity, worse
 from core.fonts import FontOracle, FontResolver
 from core.models import TextBlock
 from core.sample import create_sample_pdf
@@ -33,10 +34,171 @@ from core.snapshot import (capture_page_state, restore_page_state,
                            page_state_equal)
 from core.textbox import BoxBuffer
 from ui.diff_dialog import DiffDialog
+from ui.icons import make_icon
 from ui.page_canvas import PageCanvas
 from ui.property_panel import PropertyPanel
+from ui.theme import APP_QSS
 
 APP_TITLE = "PDF 无感编辑器 · 文本框编辑版"
+
+
+class StageHost(QWidget):
+    """页面铺满；左右侧栏都是可召唤抽屉。"""
+
+    left_toggled = Signal(bool)
+    RIGHT_W = 272
+    LEFT_W = 164
+
+    def __init__(self, canvas, left_drawer, right_drawer, parent=None):
+        super().__init__(parent)
+        self.canvas = canvas
+        self.left = left_drawer
+        self.right = right_drawer
+        self._left_open = False
+        self._right_open = False
+        self.setObjectName("RootSplit")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(240, 200)
+        canvas.setParent(self)
+        left_drawer.setParent(self)
+        right_drawer.setParent(self)
+        left_drawer.hide()
+        right_drawer.hide()
+
+    def set_left_open(self, on, *, emit=True):
+        on = bool(on)
+        if on == self._left_open:
+            return
+        self._left_open = on
+        self.left.setVisible(on)
+        self._layout_overlay()
+        if emit:
+            self.left_toggled.emit(on)
+
+    def set_right_open(self, on):
+        on = bool(on)
+        if on == self._right_open:
+            return
+        self._right_open = on
+        self.right.setVisible(on)
+        self._layout_overlay()
+
+    def toggle_left(self):
+        self.set_left_open(not self._left_open)
+
+    def toggle_right(self):
+        self.set_right_open(not self._right_open)
+
+    def toggle_drawer(self):
+        """兼容旧调用：切换右侧属性栏。"""
+        self.toggle_right()
+
+    def is_open(self):
+        return self._right_open
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.canvas.setGeometry(0, 0, self.width(), self.height())
+        self._layout_overlay()
+
+    def _layout_overlay(self):
+        w, h = self.width(), self.height()
+        if self._left_open:
+            self.left.setGeometry(0, 0, self.LEFT_W, h)
+            self.left.raise_()
+        if self._right_open:
+            self.right.setGeometry(max(0, w - self.RIGHT_W), 0, self.RIGHT_W, h)
+            self.right.raise_()
+
+
+class ChromeBar(QWidget):
+    """图标栏：左右抽屉按钮贴边，其余图标以页码为几何中心。"""
+
+    BTN = 28
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MainBar")
+        self.setFixedHeight(38)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._ends = []
+        self._items = []
+        self._pivot = None
+
+    def add_end(self, widget, side):
+        widget.setParent(self)
+        self._ends.append((widget, side))
+        return widget
+
+    def add_item(self, widget):
+        widget.setParent(self)
+        self._items.append(widget)
+        return widget
+
+    def add_sep(self):
+        line = QWidget(self)
+        line.setObjectName("BarSep")
+        line.setFixedSize(1, 16)
+        self._items.append(line)
+        return line
+
+    def set_pivot(self, widget):
+        self._pivot = widget
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.relayout()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.relayout()
+
+    def _size_of(self, wid):
+        if isinstance(wid, QToolButton):
+            return self.BTN, self.BTN
+        if wid.objectName() == "BarSep":
+            return 1, 16
+        if isinstance(wid, QLabel):
+            return max(wid.minimumWidth(), wid.sizeHint().width()), 28
+        return max(wid.sizeHint().width(), 1), max(wid.sizeHint().height(), 1)
+
+    def relayout(self):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        gap, margin = 2, 6
+
+        def place(wid, x):
+            ww, hh = self._size_of(wid)
+            wid.setGeometry(int(x), (h - hh) // 2, int(ww), int(hh))
+            return ww
+
+        for wid, side in self._ends:
+            if side == "left":
+                place(wid, margin)
+            else:
+                ww, _ = self._size_of(wid)
+                place(wid, w - margin - ww)
+            wid.raise_()
+
+        pivot = self._pivot
+        if pivot is None or pivot not in self._items:
+            return
+        idx = self._items.index(pivot)
+        pw, _ = self._size_of(pivot)
+        px = (w - pw) // 2
+        place(pivot, px)
+
+        x = px
+        for item in reversed(self._items[:idx]):
+            iw, _ = self._size_of(item)
+            x -= gap + iw
+            place(item, x)
+
+        x = px + pw
+        for item in self._items[idx + 1:]:
+            x += gap
+            x += place(item, x)
 
 
 class EditSession:
@@ -78,151 +240,178 @@ class MainWindow(QMainWindow):
 
         self.undo_stack = UndoStack(on_change=self._update_undo_actions)
 
+        self.setStyleSheet(APP_QSS)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyle("Fusion")
         self._build_ui()
 
     # ================================================== UI 构建
     def _build_ui(self):
         self.canvas = PageCanvas(self)
-        self.setCentralWidget(self.canvas)
         self.canvas.hover_pos.connect(self._on_hover)
         self.canvas.image_replace_requested.connect(self.replace_selected_image)
 
-        tb = QToolBar("主工具栏")
-        tb.setMovable(False)
-        self.addToolBar(tb)
-        self.act_open = QAction("打开", self)
-        self.act_open.setShortcut("Ctrl+O")
-        self.act_open.triggered.connect(lambda: self.open_file())
-        tb.addAction(self.act_open)
-        self.act_save = QAction("保存", self)
-        self.act_save.setShortcut("Ctrl+S")
-        self.act_save.triggered.connect(self.save)
-        tb.addAction(self.act_save)
-        self.act_verify = QAction("验证报告", self)
-        self.act_verify.triggered.connect(self.reverify)
-        tb.addAction(self.act_verify)
-        tb.addSeparator()
+        def _act(text, shortcut, slot, icon, tip=None):
+            act = QAction(make_icon(icon), text, self)
+            if shortcut:
+                act.setShortcut(shortcut)
+            act.setToolTip(tip or (f"{text}（{shortcut}）" if shortcut else text))
+            act.triggered.connect(slot)
+            self.addAction(act)
+            return act
 
-        self.act_undo = QAction("撤销", self)
-        self.act_undo.setShortcut("Ctrl+Z")
-        self.act_undo.triggered.connect(self.undo)
-        tb.addAction(self.act_undo)
-        self.act_redo = QAction("重做", self)
-        self.act_redo.setShortcut("Ctrl+Y")
-        self.act_redo.triggered.connect(self.redo)
-        tb.addAction(self.act_redo)
-        tb.addSeparator()
+        self.act_open = _act("打开", "Ctrl+O", lambda: self.open_file(), "open")
+        self.act_save = _act("保存", "Ctrl+S", self.save, "save")
+        self.act_save_as = _act("另存为", "Ctrl+Shift+S", self.save_as, "save_as",
+                               "另存为（Ctrl+Shift+S）")
+        self.act_export = _act("导出优化副本", None, self.save_optimized, "export",
+                              "导出优化副本（字体子集化）")
+        self.act_verify = _act("验证报告", None, self.reverify, "verify", "验证报告")
+        self.act_undo = _act("撤销", "Ctrl+Z", self.undo, "undo")
+        self.act_redo = _act("重做", "Ctrl+Y", self.redo, "redo")
+        self.act_cut = _act("剪切", "Ctrl+X", self.cut, "cut")
+        self.act_copy = _act("复制", "Ctrl+C", self.copy, "copy")
+        self.act_paste = _act("粘贴", "Ctrl+V", self.paste, "paste")
+        self.act_selall = _act("全选", "Ctrl+A", self.session_select_all, "select_all",
+                              "全选（框内，Ctrl+A）")
+        self.act_zoom_out = _act("缩小", "Ctrl+-", lambda: self.set_zoom(self.zoom / 1.15),
+                                "zoom_out")
+        self.act_zoom_in = _act("放大", "Ctrl+=", lambda: self.set_zoom(self.zoom * 1.15),
+                               "zoom_in")
+        self.act_fit = _act("适应宽度", None, self.fit_width, "fit", "适应宽度")
+        self.act_prev = _act("上一页", None, lambda: self.set_page(self.page_no - 1), "prev")
+        self.act_next = _act("下一页", None, lambda: self.set_page(self.page_no + 1), "next")
+        self.act_sample = _act("生成示例", None, self.make_sample, "sample", "生成示例文档")
+        self.act_fid_help = _act("保真等级说明", None, self.show_fidelity_help, "help",
+                                "保真等级说明")
+        self.act_about = _act("关于", None, self.show_about, "about", "关于")
 
-        self.act_zoom_out = QAction("缩小", self)
-        self.act_zoom_out.setShortcut("Ctrl+-")
-        self.act_zoom_out.triggered.connect(lambda: self.set_zoom(self.zoom / 1.15))
-        tb.addAction(self.act_zoom_out)
-        self.lb_zoom = QLabel("100%")
-        self.lb_zoom.setMinimumWidth(52)
-        tb.addWidget(self.lb_zoom)
-        self.act_zoom_in = QAction("放大", self)
-        self.act_zoom_in.setShortcut("Ctrl+=")
-        self.act_zoom_in.triggered.connect(lambda: self.set_zoom(self.zoom * 1.15))
-        tb.addAction(self.act_zoom_in)
-        self.act_fit = QAction("适应宽度", self)
-        self.act_fit.triggered.connect(self.fit_width)
-        tb.addAction(self.act_fit)
-        tb.addSeparator()
-
-        self.act_prev = QAction("上一页", self)
-        self.act_prev.triggered.connect(lambda: self.set_page(self.page_no - 1))
-        tb.addAction(self.act_prev)
-        self.lb_page = QLabel("- / -")
-        tb.addWidget(self.lb_page)
-        self.act_next = QAction("下一页", self)
-        self.act_next.triggered.connect(lambda: self.set_page(self.page_no + 1))
-        tb.addAction(self.act_next)
-        tb.addSeparator()
-
-        self.act_sample = QAction("生成示例", self)
-        self.act_sample.triggered.connect(self.make_sample)
-        tb.addAction(self.act_sample)
-
-        # 左侧缩略图
+        # 左侧目录（缩略图）
+        self.pane_thumbs = QWidget()
+        self.pane_thumbs.setObjectName("ThumbPane")
+        self.pane_thumbs.setMinimumWidth(0)
+        self.pane_thumbs.setMaximumWidth(16777215)
+        thumbs_lay = QVBoxLayout(self.pane_thumbs)
+        thumbs_lay.setContentsMargins(0, 0, 0, 0)
+        thumbs_lay.setSpacing(0)
+        title = QLabel("目录")
+        title.setObjectName("PaneTitle")
+        thumbs_lay.addWidget(title)
         self.thumb_list = QListWidget()
-        self.thumb_list.setIconSize(QPixmap(120, 170).size())
-        self.thumb_list.setFixedWidth(150)
+        self.thumb_list.setObjectName("ThumbList")
+        self.thumb_list.setViewMode(QListView.ViewMode.IconMode)
+        self.thumb_list.setMovement(QListView.Movement.Static)
+        self.thumb_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.thumb_list.setFlow(QListView.Flow.TopToBottom)
+        self.thumb_list.setWrapping(False)
+        self.thumb_list.setSpacing(8)
+        self.thumb_list.setIconSize(QSize(112, 154))
+        self.thumb_list.setUniformItemSizes(True)
+        self.thumb_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.thumb_list.itemClicked.connect(
             lambda it: self.set_page(self.thumb_list.row(it)))
-        dock_t = QDockWidget("页面缩略图", self)
-        dock_t.setWidget(self.thumb_list)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock_t)
+        thumbs_lay.addWidget(self.thumb_list, 1)
 
-        # 右侧属性面板
+        # 右侧属性（默认收起，由图标栏按钮召唤）
+        self.pane_props = QWidget()
+        self.pane_props.setObjectName("PropPane")
+        props_lay = QVBoxLayout(self.pane_props)
+        props_lay.setContentsMargins(0, 0, 0, 0)
+        props_lay.setSpacing(0)
+        head = QWidget()
+        head_lay = QHBoxLayout(head)
+        head_lay.setContentsMargins(12, 8, 8, 4)
+        head_lay.setSpacing(8)
+        pt = QLabel("属性")
+        pt.setObjectName("PaneTitle")
+        pt.setStyleSheet("padding: 0;")
+        head_lay.addWidget(pt)
+        head_lay.addStretch(1)
+        props_lay.addWidget(head)
         self.panel = PropertyPanel(self)
-        dock_p = QDockWidget("属性", self)
-        dock_p.setWidget(self.panel)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock_p)
+        props_lay.addWidget(self.panel, 1)
+        self.pane_props.setMinimumWidth(240)
 
-        # 菜单
-        m_file = self.menuBar().addMenu("文件(&F)")
-        m_file.addAction(self.act_open)
-        m_file.addAction(self.act_save)
-        act_saveas = QAction("另存为…", self)
-        act_saveas.setShortcut("Ctrl+Shift+S")
-        act_saveas.triggered.connect(self.save_as)
-        m_file.addAction(act_saveas)
-        act_opt = QAction("导出优化副本（字体子集化）…", self)
-        act_opt.triggered.connect(self.save_optimized)
-        m_file.addAction(act_opt)
-        m_file.addSeparator()
-        act_quit = QAction("退出", self)
-        act_quit.triggered.connect(self.close)
-        m_file.addAction(act_quit)
+        self.stage = StageHost(self.canvas, self.pane_thumbs, self.pane_props)
 
-        m_edit = self.menuBar().addMenu("编辑(&E)")
-        m_edit.addAction(self.act_undo)
-        m_edit.addAction(self.act_redo)
-        m_edit.addSeparator()
-        act_selall = QAction("全选（框内）", self)
-        act_selall.setShortcut("Ctrl+A")
-        act_selall.triggered.connect(self.session_select_all)
-        m_edit.addAction(act_selall)
-        act_copy = QAction("复制", self)
-        act_copy.setShortcut("Ctrl+C")
-        act_copy.triggered.connect(self.copy)
-        m_edit.addAction(act_copy)
-        act_cut = QAction("剪切", self)
-        act_cut.setShortcut("Ctrl+X")
-        act_cut.triggered.connect(self.cut)
-        m_edit.addAction(act_cut)
-        act_paste = QAction("粘贴", self)
-        act_paste.setShortcut("Ctrl+V")
-        act_paste.triggered.connect(self.paste)
-        m_edit.addAction(act_paste)
+        self.act_thumbs = QAction(make_icon("panel_left"), "目录", self)
+        self.act_thumbs.setCheckable(True)
+        self.act_thumbs.setChecked(False)
+        self.act_thumbs.setToolTip("显示/隐藏目录")
+        self.act_thumbs.toggled.connect(lambda on: self.stage.set_left_open(on, emit=False))
+        self.stage.left_toggled.connect(self._sync_thumbs_action)
+        self.addAction(self.act_thumbs)
 
-        m_view = self.menuBar().addMenu("视图(&V)")
-        m_view.addAction(self.act_zoom_in)
-        m_view.addAction(self.act_zoom_out)
-        m_view.addAction(self.act_fit)
-        m_view.addAction(dock_t.toggleViewAction())
-        m_view.addAction(dock_p.toggleViewAction())
+        self.act_props = QAction(make_icon("menu"), "属性栏", self)
+        self.act_props.setCheckable(True)
+        self.act_props.setChecked(False)
+        self.act_props.setToolTip("显示/隐藏属性栏")
+        self.act_props.toggled.connect(self.stage.set_right_open)
+        self.addAction(self.act_props)
 
-        m_help = self.menuBar().addMenu("帮助(&H)")
-        act_fid = QAction("保真等级说明", self)
-        act_fid.triggered.connect(self.show_fidelity_help)
-        m_help.addAction(act_fid)
-        act_about = QAction("关于", self)
-        act_about.triggered.connect(self.show_about)
-        m_help.addAction(act_about)
+        self.chrome = ChromeBar(self)
 
-        # 状态栏
-        self.lb_pos = QLabel("—")
-        self.lb_mode = QLabel("文本框编辑模式（类 PPT）")
-        self.lb_fid = QLabel("未打开")
-        self.lb_fid.setStyleSheet("color:#fff; background:#888; border-radius:3px; padding:2 8px;")
-        sb = self.statusBar()
-        sb.addWidget(self.lb_pos)
-        sb.addPermanentWidget(self.lb_mode)
-        sb.addPermanentWidget(self.lb_fid)
+        def _btn(act):
+            btn = QToolButton(self.chrome)
+            btn.setDefaultAction(act)
+            btn.setAutoRaise(True)
+            btn.setIconSize(QSize(18, 18))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            return btn
+
+        def _label(text, min_w):
+            lb = QLabel(text, self.chrome)
+            lb.setObjectName("ChromeLabel")
+            lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lb.setMinimumWidth(min_w)
+            return lb
+
+        self.chrome.add_end(_btn(self.act_thumbs), "left")
+        self.chrome.add_end(_btn(self.act_props), "right")
+        for act in (self.act_open, self.act_save, self.act_save_as,
+                    self.act_export, self.act_verify):
+            self.chrome.add_item(_btn(act))
+        self.chrome.add_sep()
+        for act in (self.act_undo, self.act_redo, self.act_cut,
+                    self.act_copy, self.act_paste, self.act_selall):
+            self.chrome.add_item(_btn(act))
+        self.chrome.add_sep()
+        self.chrome.add_item(_btn(self.act_zoom_out))
+        self.lb_zoom = _label("100%", 44)
+        self.chrome.add_item(self.lb_zoom)
+        self.chrome.add_item(_btn(self.act_zoom_in))
+        self.chrome.add_item(_btn(self.act_fit))
+        self.chrome.add_sep()
+        self.chrome.add_item(_btn(self.act_prev))
+        self.lb_page = _label("- / -", 56)
+        self.chrome.add_item(self.lb_page)
+        self.chrome.set_pivot(self.lb_page)
+        self.chrome.add_item(_btn(self.act_next))
+        self.chrome.add_sep()
+        for act in (self.act_sample, self.act_fid_help, self.act_about):
+            self.chrome.add_item(_btn(act))
+
+        shell = QWidget()
+        shell.setObjectName("RootSplit")
+        shell_lay = QVBoxLayout(shell)
+        shell_lay.setContentsMargins(0, 0, 0, 0)
+        shell_lay.setSpacing(0)
+        shell_lay.addWidget(self.chrome)
+        shell_lay.addWidget(self.stage, 1)
+        self.setCentralWidget(shell)
+
+        self.menuBar().hide()
+        self.statusBar().hide()
 
         self.canvas.set_hint("打开 PDF 后：单击选中文本框，双击进入编辑；图片可拖动/缩放/旋转")
         self._update_undo_actions()
+
+    def _sync_thumbs_action(self, on):
+        self.act_thumbs.blockSignals(True)
+        self.act_thumbs.setChecked(on)
+        self.act_thumbs.blockSignals(False)
 
     # ================================================== 文档管理
     def open_file(self, path=None):
@@ -265,6 +454,9 @@ class MainWindow(QMainWindow):
         perm = getattr(fitz, "PDF_PERM_MODIFY", 4)
         self._can_modify = (not doc.is_encrypted) or bool(doc.permissions & perm)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
+        self.zoom = 1.0
+        self.lb_zoom.setText("100%")
+        self.chrome.relayout()
         self.set_page(0)
         self._build_thumbs()
         self.status_hint("编辑直接修改内容流（真删除，非遮盖）；撤销为字节级原版恢复")
@@ -301,6 +493,7 @@ class MainWindow(QMainWindow):
         self.canvas.apply_zoom()
         self.canvas.refresh_overlays()
         self.lb_page.setText(f"{i + 1} / {self.doc.page_count}")
+        self.chrome.relayout()
         self.thumb_list.setCurrentRow(i)
         self._update_panels()
 
@@ -323,7 +516,9 @@ class MainWindow(QMainWindow):
             pix = page.get_pixmap(matrix=fitz.Matrix(zw, zw), alpha=False)
             img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                          QImage.Format.Format_RGB888).copy()
-            self.thumb_list.addItem(QListWidgetItem(QPixmap.fromImage(img), f"{i + 1}"))
+            item = QListWidgetItem(QPixmap.fromImage(img), f"{i + 1}")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            self.thumb_list.addItem(item)
             if i % 5 == 4:
                 QApplication.processEvents()
 
@@ -945,6 +1140,7 @@ class MainWindow(QMainWindow):
         z = max(0.15, min(6.0, z))
         self.zoom = z
         self.lb_zoom.setText(f"{z * 100:.0f}%")
+        self.chrome.relayout()
         if self.doc is None:
             return
         self._refresh_render_only()
@@ -958,10 +1154,10 @@ class MainWindow(QMainWindow):
         self.set_zoom(z)
 
     def _on_hover(self, x, y):
-        self.lb_pos.setText(f"({x:.1f}, {y:.1f})")
+        return
 
     def status_hint(self, msg):
-        self.statusBar().showMessage(msg, 6000)
+        return
 
     def _update_panels(self):
         self.panel.update_style(self.current_style())
@@ -977,13 +1173,9 @@ class MainWindow(QMainWindow):
             self.panel.update_selection(0, 0)
         fid = self.fidelities.get(self.page_no)
         if fid is not None:
-            self.lb_fid.setText(LABELS.get(fid.level, fid.level))
-            self.lb_fid.setStyleSheet(
-                f"color:#fff; background:{COLORS.get(fid.level, '#888')};"
-                "border-radius:3px; padding:2 8px;")
             self.panel.update_fidelity(fid.level, fid.reasons)
         else:
-            self.lb_fid.setText("未打开")
+            self.panel.update_fidelity("—", [])
 
     def _update_undo_actions(self):
         self.act_undo.setEnabled(self.undo_stack.can_undo)
@@ -1001,7 +1193,19 @@ class MainWindow(QMainWindow):
     def make_sample(self):
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "示例文档.pdf")
-        create_sample_pdf(path)
+        # 当前打开的正是这份文件时，Windows 会锁住无法覆盖
+        if self.doc is not None:
+            try:
+                self.doc.close()
+            except Exception:
+                pass
+            self.doc = None
+            self.doc_path = ""
+        try:
+            create_sample_pdf(path)
+        except Exception as e:
+            QMessageBox.critical(self, "生成失败", f"无法写出示例文档：{e}")
+            return
         self.open_file(path)
 
     def show_fidelity_help(self):

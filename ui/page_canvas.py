@@ -9,8 +9,9 @@ import math
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QPainter, QPen)
-from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsPixmapItem,
-                               QGraphicsScene, QGraphicsView, QMenu)
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsItem,
+                               QGraphicsPixmapItem, QGraphicsScene,
+                               QGraphicsView, QMenu)
 
 from core.geom import qrect_args, resize_rect
 
@@ -311,6 +312,9 @@ class PageCanvas(QGraphicsView):
         self.setInteractive(False)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(QBrush(QColor("#4B4F55")))
+        self._scene.setBackgroundBrush(QBrush(QColor("#4B4F55")))
 
         self.pixmap_item = None
         self.box_editor = BoxEditorItem(self)
@@ -318,7 +322,7 @@ class PageCanvas(QGraphicsView):
         self.handle_layer = HandleLayer(self)
         self._scene.addItem(self.handle_layer)
         self.hint_item = self._scene.addText("", QFont("Microsoft YaHei", 12))
-        self.hint_item.setDefaultTextColor(QColor("#8a8a8a"))
+        self.hint_item.setDefaultTextColor(QColor("#C5CAD1"))
         self.hint_item.setPos(24, 12)
         self.hint_item.setZValue(5)
         self.hint_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
