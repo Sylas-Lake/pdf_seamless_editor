@@ -37,6 +37,9 @@ smoke*.png
 tmp/
 temp/
 
+# Design drafts kept local
+*.docx
+
 # Local secrets
 .env
 .env.*
