@@ -110,6 +110,27 @@ def main():
         a2 = oracle.advance(st, "A")
         check("CJK advance 全宽", abs(a1 - st.size) < 0.01)
         check("内置 CJK 字体下 ASCII 全宽", abs(a2 - st.size) < 0.01)
+        # 自适应宽度：追加长文本后面框应变宽（不再卡在默认 wrap 宽）
+        buf2 = BoxBuffer(blk)
+        buf2.set_measure(oracle.adv_fn())
+        w0 = buf2.bbox()[2] - buf2.bbox()[0]
+        buf2.insert((0, len(buf2.hard_lines[0])), "——自适应宽度测试附加内容——")
+        w1 = buf2.bbox()[2] - buf2.bbox()[0]
+        check("文本框随内容变宽", w1 > w0 + 30, f"{w0:.1f}->{w1:.1f}")
+
+    from core.geom import qrect_args, resize_rect
+    qa = qrect_args((72, 120, 352, 300))
+    check("QRect 参数是宽高不是 x1y1", abs(qa[2] - 280) < 0.01 and abs(qa[3] - 180) < 0.01)
+    r0 = (10.0, 20.0, 50.0, 80.0)  # 40×60
+    rn = resize_rect(r0, "n", 30, 5)
+    check("上边缩放保持宽度", abs((rn[2] - rn[0]) - 40) < 1e-6 and abs(rn[1] - 5) < 1e-6)
+    rs = resize_rect(r0, "s", 30, 110)
+    check("下边缩放保持宽度", abs((rs[2] - rs[0]) - 40) < 1e-6 and abs(rs[3] - 110) < 1e-6)
+    re = resize_rect(r0, "e", 90, 50)
+    check("右边缩放保持高度", abs((re[3] - re[1]) - 60) < 1e-6 and abs(re[2] - 90) < 1e-6)
+    rse = resize_rect(r0, "se", 90, 140, keep_aspect=True)
+    check("右下角等比缩放", abs((rse[2] - rse[0]) / max(rse[3] - rse[1], 1e-6) - 40 / 60) < 0.02,
+          f"{rse}")
 
     # ---- 3. 会话提交 + 字节级撤销（核心） ----
     blk = block_with(model0, "HT-2026-0917")

@@ -38,14 +38,50 @@ def main():
     check("缩略图", win.thumb_list.count() == 2)
     check("保真初始为绿", win.fidelities[0].level == "green")
 
-    # 2. 双击进入会话（模拟）
+    # 2. 双击进入会话（Windows 序列：Press → Release → DblClick）
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent
+
+    def send_mouse(etype, sx, sy):
+        vp = win.canvas.mapFromScene(QPointF(sx, sy))
+        glob = win.canvas.viewport().mapToGlobal(vp)
+        ev = QMouseEvent(etype, QPointF(vp), QPointF(glob),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(win.canvas.viewport(), ev)
+        app.processEvents()
+
     model = win._model()
     blk = next((b for b in model.blocks if "HT-2026-0917" in b.text()), None)
     check("定位目标框", blk is not None)
     if blk:
+        cx = (blk.bbox[0] + blk.bbox[2]) / 2
+        cy = (blk.bbox[1] + blk.bbox[3]) / 2
+        win.canvas.setFocus()
+        send_mouse(QEvent.Type.MouseButtonPress, cx, cy)
+        send_mouse(QEvent.Type.MouseButtonRelease, cx, cy)
+        send_mouse(QEvent.Type.MouseButtonDblClick, cx, cy)
+        send_mouse(QEvent.Type.MouseButtonRelease, cx, cy)
+        check("双击进入会话", win.session is not None)
+        check("编辑覆盖层显示", win.canvas.box_editor.isVisible())
+        if win.session is not None:
+            ke = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z,
+                           Qt.KeyboardModifier.NoModifier, "Z")
+            win.canvas.keyPressEvent(ke)
+            app.processEvents()
+            check("双击后可输入", "Z" in win.session.buffer.text(),
+                  win.session.buffer.text()[:40])
+            bb = win.session.buffer.bbox()
+            check("编辑框随文本有宽高",
+                  (bb[2] - bb[0]) > 40 and (bb[3] - bb[1]) > 8, str(bb))
+        # 取消后走原有缓冲编辑断言
+        if win.session is not None:
+            win.cancel_session()
+            check("双击会话可取消", win.session is None)
+
         win.start_session(blk)
         check("会话建立", win.session is not None)
-        check("编辑覆盖层显示", win.canvas.box_editor.isVisible())
+        check("编辑覆盖层显示(程序)", win.canvas.box_editor.isVisible())
         # 会话内输入：光标应随输入推进（缓冲模型）
         line0 = blk.lines[0].text()
         gi = line0.find("HT-2026-0917")
@@ -107,6 +143,12 @@ def main():
         win.select_block(blk)
         check("框选中手柄", win.canvas.handle_layer.isVisible()
               and win.canvas.handle_layer.mode == "box")
+        hr = win.canvas.handle_layer.rect
+        check("文本框手柄宽高匹配内容",
+              abs(hr.width() - (blk.bbox[2] - blk.bbox[0])) < 0.6
+              and abs(hr.height() - (blk.bbox[3] - blk.bbox[1])) < 0.6,
+              f"handle={hr.width():.1f}x{hr.height():.1f} "
+              f"bbox={blk.bbox[2]-blk.bbox[0]:.1f}x{blk.bbox[3]-blk.bbox[1]:.1f}")
         win.commit_block_transform(blk, 30, 0, 0, "移动文本框")
         check("框移动提交", win.undo_stack.can_undo)
         t = win.doc[0].get_text()
@@ -127,6 +169,26 @@ def main():
             win.select_image(got)
             check("图片手柄", win.canvas.handle_layer.isVisible()
                   and win.canvas.handle_layer.mode == "image")
+            hr = win.canvas.handle_layer.rect
+            ow, oh = got.rect[2] - got.rect[0], got.rect[3] - got.rect[1]
+            check("图片手柄宽高匹配",
+                  abs(hr.width() - ow) < 0.6 and abs(hr.height() - oh) < 0.6,
+                  f"handle={hr.width():.1f}x{hr.height():.1f} img={ow:.1f}x{oh:.1f}")
+            npos = win.canvas.handle_layer.corner_points()["n"]
+            win.canvas._start_drag("n", QPointF(*npos))
+            win.canvas._update_drag(QPointF(npos[0], npos[1] - 24))
+            nr = win.canvas._drag["cur_rect"]
+            check("上边手柄改变高度且保持宽度",
+                  abs(nr.width() - ow) < 1.0 and nr.height() > oh + 10,
+                  f"{nr.width():.1f}x{nr.height():.1f}")
+            se = win.canvas.handle_layer.corner_points()["se"]
+            win.canvas._start_drag("se", QPointF(*se))
+            win.canvas._update_drag(QPointF(se[0] + 50, se[1] + 20))
+            sr = win.canvas._drag["cur_rect"]
+            check("右下角手柄放大", sr.width() > ow + 8 and sr.height() > oh + 5,
+                  f"{sr.width():.1f}x{sr.height():.1f}")
+            win.canvas._drag = None
+            win.canvas._refresh_handles()
             old = tuple(got.rect)
             new = (old[0] + 40, old[1], old[2] + 70, old[3] + 30)
             win.commit_image_transform(old, got.deg, new, got.deg, "移动图片")

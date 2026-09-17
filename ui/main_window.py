@@ -394,14 +394,16 @@ class MainWindow(QMainWindow):
         executor.remove_text_region(page, _expand(block.bbox, 0.6))
         buffer = BoxBuffer(block)
         oracle = FontOracle(self.resolver, page)
+        buffer.set_measure(oracle.adv_fn())
         sess = EditSession(block, self.page_no, buffer, before, oracle)
         self.session = sess
         self.selected_block = None
         self.selected_image = None
-        # 光标置于框首
+        # 光标置于框首（双击路径会按点击位置再定位）
         sess.cursor = (0, 0)
         self._refresh_render_only()
         self.canvas.refresh_overlays()
+        self.canvas._grab_focus()
         self.status_hint("编辑中：单击定位，拖选/双击选词，Enter 换行，Esc 取消，点击框外提交")
         self._update_panels()
 
@@ -706,10 +708,12 @@ class MainWindow(QMainWindow):
         before = capture_page_state(self.doc, page)
         buffer = BoxBuffer(block)
         oracle = FontOracle(self.resolver, page)
+        buffer.set_measure(oracle.adv_fn())
         if abs(dx) > 0.5 or abs(dy) > 0.5:
             buffer.translate(dx, dy)
         if abs(dw) > 0.5:
-            buffer.set_width(buffer.width + dw)
+            # dw 相对 PDF 框宽，不能加在 auto_width 后的内容宽度上
+            buffer.set_width((block.bbox[2] - block.bbox[0]) + dw)
         executor.remove_text_region(page, _expand(block.bbox, 0.6))
         runs = buffer.commit_runs(oracle)
         executor.insert_runs(page, runs, self.resolver)

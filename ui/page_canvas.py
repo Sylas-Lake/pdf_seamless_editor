@@ -8,12 +8,37 @@
 import math
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
-from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPen,
-                            QPixmap)
-from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QPainter, QPen)
+from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsPixmapItem,
                                QGraphicsScene, QGraphicsView, QMenu)
 
+from core.geom import qrect_args, resize_rect
+
 ACCENT = QColor(21, 101, 192)
+CORNERS = ("nw", "ne", "se", "sw")
+
+_HANDLE_CURSORS = {
+    "n": Qt.CursorShape.SizeVerCursor,
+    "s": Qt.CursorShape.SizeVerCursor,
+    "e": Qt.CursorShape.SizeHorCursor,
+    "w": Qt.CursorShape.SizeHorCursor,
+    "nw": Qt.CursorShape.SizeFDiagCursor,
+    "se": Qt.CursorShape.SizeFDiagCursor,
+    "ne": Qt.CursorShape.SizeBDiagCursor,
+    "sw": Qt.CursorShape.SizeBDiagCursor,
+    "rot": Qt.CursorShape.CrossCursor,
+    "move": Qt.CursorShape.SizeAllCursor,
+}
+
+
+def to_qrect(xyxy) -> QRectF:
+    """PDF (x0,y0,x1,y1) → QRectF(x, y, w, h)。"""
+    x, y, w, h = qrect_args(xyxy)
+    return QRectF(x, y, w, h)
+
+
+def qrect_xyxy(r: QRectF) -> tuple:
+    return (r.left(), r.top(), r.right(), r.bottom())
 
 
 class HandleLayer(QGraphicsItem):
@@ -27,6 +52,7 @@ class HandleLayer(QGraphicsItem):
         self.mode = "image"
         self.setVisible(False)
         self.setZValue(50)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
     def set_state(self, rect: QRectF, deg=0.0, mode=None):
         self.prepareGeometryChange()
@@ -40,38 +66,98 @@ class HandleLayer(QGraphicsItem):
     def hide_layer(self):
         self.setVisible(False)
 
+    def _z(self):
+        return max(self.canvas.zoom, 0.05)
+
     def boundingRect(self):
-        m = 34.0 / max(self.canvas.zoom, 0.05)
+        m = 40.0 / self._z()
         return self.rect.adjusted(-m, -m, m, m)
 
-    def corner_points(self):
+    def _local_points(self):
         r = self.rect
         cx = (r.left() + r.right()) / 2
         cy = (r.top() + r.bottom()) / 2
         if self.mode == "box":
-            # 文本框：仅左右调宽手柄
             return {"w": (r.left(), cy), "e": (r.right(), cy)}
         pts = {"nw": (r.left(), r.top()), "n": (cx, r.top()),
                "ne": (r.right(), r.top()), "e": (r.right(), cy),
                "se": (r.right(), r.bottom()), "s": (cx, r.bottom()),
                "sw": (r.left(), r.bottom()), "w": (r.left(), cy)}
-        pts["rot"] = (cx, r.top() - 26.0 / max(self.canvas.zoom, 0.05))
+        pts["rot"] = (cx, r.top() - 32.0 / self._z())
         return pts
+
+    def _to_local(self, sp: QPointF) -> QPointF:
+        if self.mode == "image" and abs(self.deg) > 0.5:
+            c = self.rect.center()
+            rad = math.radians(-self.deg)
+            dx, dy = sp.x() - c.x(), sp.y() - c.y()
+            ca, sa = math.cos(rad), math.sin(rad)
+            return QPointF(c.x() + dx * ca - dy * sa,
+                           c.y() + dx * sa + dy * ca)
+        return QPointF(sp)
+
+    def _to_world(self, x, y):
+        if self.mode == "image" and abs(self.deg) > 0.5:
+            c = self.rect.center()
+            rad = math.radians(self.deg)
+            dx, dy = x - c.x(), y - c.y()
+            ca, sa = math.cos(rad), math.sin(rad)
+            return (c.x() + dx * ca - dy * sa, c.y() + dx * sa + dy * ca)
+        return (x, y)
+
+    def corner_points(self):
+        return {name: self._to_world(x, y)
+                for name, (x, y) in self._local_points().items()}
 
     def hit_handle(self, sp: QPointF):
         if not self.isVisible():
             return None
-        tol = 8.0 / max(self.canvas.zoom, 0.05)
-        for name, (hx, hy) in self.corner_points().items():
-            if abs(sp.x() - hx) <= tol and abs(sp.y() - hy) <= tol:
+        p = self._to_local(sp)
+        z = self._z()
+        corner_tol = 14.0 / z
+        edge_tol = 8.0 / z
+        rot_tol = 12.0 / z
+        r = self.rect
+        pts = self._local_points()
+
+        if "rot" in pts:
+            hx, hy = pts["rot"]
+            if abs(p.x() - hx) <= rot_tol and abs(p.y() - hy) <= rot_tol:
+                return "rot"
+
+        for name in CORNERS:
+            if name not in pts:
+                continue
+            hx, hy = pts[name]
+            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
                 return name
-        if self.rect.contains(sp):
+
+        if self.mode == "image":
+            inside_x = r.left() - edge_tol <= p.x() <= r.right() + edge_tol
+            inside_y = r.top() - edge_tol <= p.y() <= r.bottom() + edge_tol
+            if inside_x and abs(p.y() - r.top()) <= edge_tol:
+                return "n"
+            if inside_x and abs(p.y() - r.bottom()) <= edge_tol:
+                return "s"
+            if inside_y and abs(p.x() - r.right()) <= edge_tol:
+                return "e"
+            if inside_y and abs(p.x() - r.left()) <= edge_tol:
+                return "w"
+            if r.contains(p):
+                return "move"
+            return None
+
+        for name in ("w", "e"):
+            hx, hy = pts[name]
+            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
+                return name
+        if r.contains(p):
             return "move"
         return None
 
     def paint(self, painter, option, widget):
-        z = max(self.canvas.zoom, 0.05)
-        s = 8.0 / z
+        z = self._z()
+        s = 10.0 / z
         painter.setPen(QPen(ACCENT, 0, Qt.PenStyle.DashLine))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if self.deg and self.mode == "image":
@@ -87,9 +173,9 @@ class HandleLayer(QGraphicsItem):
         for name, (hx, hy) in self.corner_points().items():
             if name == "rot":
                 painter.setBrush(QBrush(ACCENT))
-                painter.drawEllipse(QPointF(hx, hy), s * 0.75, s * 0.75)
-                painter.drawLine(QPointF(self.rect.center().x(), self.rect.top()),
-                                 QPointF(hx, hy))
+                painter.drawEllipse(QPointF(hx, hy), s * 0.7, s * 0.7)
+                tx, ty = self._to_world(self.rect.center().x(), self.rect.top())
+                painter.drawLine(QPointF(tx, ty), QPointF(hx, hy))
             else:
                 painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
                 painter.drawRect(QRectF(hx - s / 2, hy - s / 2, s, s))
@@ -103,6 +189,7 @@ class BoxEditorItem(QGraphicsItem):
         self.canvas = canvas
         self.setZValue(40)
         self.setVisible(False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._blink_on = True
         self._font_cache = {}
 
@@ -112,7 +199,7 @@ class BoxEditorItem(QGraphicsItem):
         if sess is None:
             return QRectF()
         bb = sess.buffer.bbox()
-        m = 8.0
+        m = 12.0
         return QRectF(bb[0] - m, bb[1] - m, (bb[2] - bb[0]) + 2 * m,
                       (bb[3] - bb[1]) + 2 * m)
 
@@ -135,7 +222,7 @@ class BoxEditorItem(QGraphicsItem):
 
         # 框边界
         bb = buf.bbox()
-        painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 110),
+        painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 160),
                             0, Qt.PenStyle.DashLine))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(QRectF(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1]))
@@ -172,12 +259,13 @@ class BoxEditorItem(QGraphicsItem):
                 painter.drawText(QPointF(cx, v.baseline), ch)
                 cx += oracle.advance(st, ch)
 
-        # 光标
+        # 光标（屏幕约 2px，避免缩放过细看不见）
         if self._blink_on and sess.preedit == "":
             x, bl = buf.cursor_pos(sess.cursor, adv)
+            cw = max(1.2, 2.0 / max(self.canvas.zoom, 0.05))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(ACCENT))
-            painter.drawRect(QRectF(x - 0.6, bl - lh * 0.78, 1.3, lh))
+            painter.drawRect(QRectF(x - cw / 2, bl - lh * 0.78, cw, lh))
 
         # 输入法预编辑
         if sess.preedit:
@@ -219,6 +307,10 @@ class PageCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        # 事件全部由视图处理，避免 pixmap 吞掉 Windows 的 DblClick
+        self.setInteractive(False)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
 
         self.pixmap_item = None
         self.box_editor = BoxEditorItem(self)
@@ -229,6 +321,7 @@ class PageCanvas(QGraphicsView):
         self.hint_item.setDefaultTextColor(QColor("#8a8a8a"))
         self.hint_item.setPos(24, 12)
         self.hint_item.setZValue(5)
+        self.hint_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
         # 交互状态
         self._selecting = False
@@ -252,6 +345,7 @@ class PageCanvas(QGraphicsView):
             return
         self.pixmap_item = QGraphicsPixmapItem(pixmap)
         self.pixmap_item.setZValue(-10)
+        self.pixmap_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._scene.addItem(self.pixmap_item)
         self._scene.setSceneRect(QRectF(0, 0, page_w, page_h))
 
@@ -278,6 +372,7 @@ class PageCanvas(QGraphicsView):
         if sess is not None:
             self.box_editor.prepareGeometryChange()
             self.box_editor._font_cache.clear()
+            self.box_editor._blink_on = True
             self.box_editor.update()
         self._refresh_handles()
 
@@ -289,9 +384,9 @@ class PageCanvas(QGraphicsView):
         img = c.selected_image
         blk = c.selected_block
         if img is not None:
-            self.handle_layer.set_state(QRectF(*img.rect), img.deg, "image")
+            self.handle_layer.set_state(to_qrect(img.rect), img.deg, "image")
         elif blk is not None:
-            self.handle_layer.set_state(QRectF(*blk.bbox), 0.0, "box")
+            self.handle_layer.set_state(to_qrect(blk.bbox), 0.0, "box")
         else:
             self.handle_layer.hide_layer()
 
@@ -305,11 +400,11 @@ class PageCanvas(QGraphicsView):
             c.session_set_preedit(e.preeditString())
             e.accept()
             return
-        e.accept()
+        e.ignore()
 
     def inputMethodQuery(self, q):
         if q == Qt.InputMethodQuery.ImEnabled:
-            return True
+            return self.session_active()
         if q == Qt.InputMethodQuery.ImCursorRectangle:
             c = self.controller
             if self.session_active():
@@ -325,8 +420,27 @@ class PageCanvas(QGraphicsView):
         p = self.mapToScene(e.position().toPoint())
         return p.x(), p.y()
 
+    def _grab_focus(self):
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.viewport().setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def _try_begin_edit(self, x, y):
+        """双击文本框进入编辑。成功返回 True。"""
+        c = self.controller
+        block = c.hit_block(x, y)
+        if block is None:
+            return False
+        c.start_session(block)
+        if c.session is None:
+            return False
+        c.session_click(x, y)
+        self._grab_focus()
+        self.box_editor._blink_on = True
+        self.box_editor.update()
+        return True
+
     def mousePressEvent(self, e):
-        self.setFocus()
+        self._grab_focus()
         if e.button() != Qt.MouseButton.LeftButton:
             if e.button() == Qt.MouseButton.RightButton and self.controller.selected_image:
                 self._image_menu(e)
@@ -360,6 +474,12 @@ class PageCanvas(QGraphicsView):
             # 会话外点击：提交并继续处理
             c.commit_session()
 
+        # Windows 上第二次按下是 DblClick；部分平台会再发 Press。
+        # 必须先于手柄命中，否则选中框会把双击吞成拖动。
+        if self._click_count >= 2 and self._try_begin_edit(x, y):
+            e.accept()
+            return
+
         # 手柄命中（图片/文本框变换）
         hit = self.handle_layer.hit_handle(sp)
         if hit and not self.session_active():
@@ -369,10 +489,7 @@ class PageCanvas(QGraphicsView):
 
         block = c.hit_block(x, y)
         if block is not None:
-            if self._click_count == 2:
-                c.start_session(block)
-            else:
-                c.select_block(block)
+            c.select_block(block)
             e.accept()
             return
 
@@ -405,7 +522,26 @@ class PageCanvas(QGraphicsView):
             self.controller.session_drag(x, y)
             e.accept()
             return
+        self._update_hover_cursor(sp)
         super().mouseMoveEvent(e)
+
+    def _update_hover_cursor(self, sp: QPointF):
+        if self.session_active():
+            self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
+            return
+        hit = self.handle_layer.hit_handle(sp)
+        if hit:
+            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+                hit, Qt.CursorShape.ArrowCursor)))
+            return
+        x, y = sp.x(), sp.y()
+        c = self.controller
+        if c.hit_block(x, y) is not None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
+        elif c.image_at(x, y) is not None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        else:
+            self.viewport().unsetCursor()
 
     def mouseReleaseEvent(self, e):
         if self._drag is not None:
@@ -416,6 +552,23 @@ class PageCanvas(QGraphicsView):
         super().mouseReleaseEvent(e)
 
     def mouseDoubleClickEvent(self, e):
+        # Windows：双击第二次按下只发 MouseButtonDblClick，不会再进 mousePressEvent。
+        if e.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(e)
+            return
+        self._grab_focus()
+        x, y = self._pdf_pos(e)
+        c = self.controller
+        if self.session_active():
+            bb = c.session.buffer.bbox()
+            pad = 6
+            if (bb[0] - pad <= x <= bb[2] + pad and bb[1] - pad <= y <= bb[3] + pad):
+                c.session_select_word(x, y)
+            e.accept()
+            return
+        if self._try_begin_edit(x, y):
+            e.accept()
+            return
         e.accept()
 
     def wheelEvent(self, e):
@@ -427,18 +580,26 @@ class PageCanvas(QGraphicsView):
         else:
             super().wheelEvent(e)
 
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        if self.session_active():
+            self.box_editor._blink_on = True
+            self.box_editor.update()
+
     # ------------------------------------------------ 拖拽（图片 / 文本框）
     def _start_drag(self, hit, sp):
         c = self.controller
         img = c.selected_image
         blk = c.selected_block
         if img is not None and self.handle_layer.mode == "image":
-            r = QRectF(*img.rect)
+            r = to_qrect(img.rect)
             self._drag = {"kind": "image", "mode": hit, "start_rect": QRectF(r),
                           "cur_rect": QRectF(r), "deg": img.deg, "corner": hit,
                           "start_pos": QPointF(sp), "img": img}
+            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+                hit, Qt.CursorShape.SizeAllCursor)))
         elif blk is not None and self.handle_layer.mode == "box":
-            r = QRectF(*blk.bbox)
+            r = to_qrect(blk.bbox)
             self._drag = {"kind": "block", "mode": hit, "start_rect": QRectF(r),
                           "cur_rect": QRectF(r), "corner": hit,
                           "start_pos": QPointF(sp), "block": blk}
@@ -471,34 +632,26 @@ class PageCanvas(QGraphicsView):
             ang = math.degrees(math.atan2(p.y() - ctr.y(), p.x() - ctr.x())) + 90.0
             d["deg"] = ang % 360
         else:
-            anchors = {"nw": r0.bottomRight(), "n": QPointF(r0.center().x(), r0.bottom()),
-                       "ne": r0.bottomLeft(), "e": QPointF(r0.left(), r0.center().y()),
-                       "se": r0.topLeft(), "s": QPointF(r0.center().x(), r0.top()),
-                       "sw": r0.topRight(), "w": QPointF(r0.right(), r0.center().y())}
-            a = anchors[d["mode"]]
-            v = QPointF(p.x() - a.x(), p.y() - a.y())
-            if d["mode"] in ("n", "s"):
-                v.setX(0.0)
-            elif d["mode"] in ("e", "w"):
-                v.setY(0.0)
-            else:
-                # 等比例（按拖拽主轴）
-                aspect = r0.width() / r0.height() if r0.height() else 1.0
-                ex = 1e-6 if abs(v.x()) < 1e-6 else v.x()
-                ey = 1e-6 if abs(v.y()) < 1e-6 else v.y()
-                if abs(ex) / aspect >= abs(ey):
-                    v = QPointF(ex, (1 if ey > 0 else -1) * abs(ex) / aspect)
-                else:
-                    v = QPointF((1 if ex > 0 else -1) * abs(ey) * aspect, ey)
-            nr = QRectF(a.x(), a.y(), v.x(), v.y()).normalized()
-            if nr.width() < 4 or nr.height() < 4:
-                nr = d["cur_rect"]
-            d["cur_rect"] = nr
+            deg = d.get("deg", 0.0) or 0.0
+            if abs(deg) > 0.5:
+                cpt = r0.center()
+                rad = math.radians(-deg)
+                dx, dy = p.x() - cpt.x(), p.y() - cpt.y()
+                ca, sa = math.cos(rad), math.sin(rad)
+                p = QPointF(cpt.x() + dx * ca - dy * sa,
+                            cpt.y() + dx * sa + dy * ca)
+            mods = QApplication.keyboardModifiers()
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            keep_aspect = (d["mode"] in CORNERS) != shift
+            nr = resize_rect(qrect_xyxy(r0), d["mode"], p.x(), p.y(),
+                             keep_aspect=keep_aspect, min_size=8.0)
+            d["cur_rect"] = to_qrect(nr)
         self.handle_layer.set_state(d["cur_rect"], d.get("deg", 0.0), "image")
 
     def _finish_drag(self):
         d = self._drag
         self._drag = None
+        self.viewport().unsetCursor()
         if d is None:
             return
         c = self.controller
@@ -513,9 +666,9 @@ class PageCanvas(QGraphicsView):
                 return
             title = {"move": "移动图片", "rot": "旋转图片"}.get(d["mode"], "缩放图片")
             c.commit_image_transform(
-                (old.x(), old.y(), old.x() + old.width(), old.y() + old.height()),
+                qrect_xyxy(old),
                 d["img"].deg,
-                (new.x(), new.y(), new.x() + new.width(), new.y() + new.height()),
+                qrect_xyxy(new),
                 d["deg"], title)
         else:
             old = d["start_rect"]

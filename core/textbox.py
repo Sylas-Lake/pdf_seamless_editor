@@ -28,12 +28,15 @@ class BoxBuffer:
     def __init__(self, block: TextBlock = None):
         self.hard_lines = []      # [[(char, style), ...]]
         self.box_left = 0.0
-        self.width = 200.0
+        self.width = 20.0
+        self.min_width = 20.0
+        self.auto_width = True    # 随内容变宽；左右拖动手柄后锁定并换行
         self.first_baseline = 0.0
         self.line_height = 14.0
         self.visual = []          # 布局结果 [VisualLine]
         self._origin_text = ""
         self._orig_visual_count = 0
+        self._adv_fn = None
         if block is not None:
             self._from_block(block)
 
@@ -46,7 +49,9 @@ class BoxBuffer:
         b = block.bbox
         self.box_left = min(l.glyphs[0].origin[0] for l in block.lines
                             if l.glyphs) if block.lines and block.lines[0].glyphs else b[0]
-        self.width = max(20.0, b[2] - self.box_left)
+        self.min_width = max(20.0, block.dominant_style().size)
+        self.width = max(self.min_width, b[2] - self.box_left)
+        self.auto_width = True
         self.first_baseline = block.first_baseline
         # 行距：原始行基线差均值，退化用主导字号 × 1.35
         bld = [l.baseline for l in block.lines if l.glyphs]
@@ -71,17 +76,32 @@ class BoxBuffer:
     def char_count(self) -> int:
         return sum(len(hl) for hl in self.hard_lines)
 
+    def set_measure(self, adv_fn):
+        """绑定与 PDF 提交一致的 advance 回调，并立即重排。"""
+        self._adv_fn = adv_fn
+        self.layout()
+
+    def _measure(self, adv_fn=None):
+        if adv_fn is not None:
+            return adv_fn
+        if self._adv_fn is not None:
+            return self._adv_fn
+
+        def approx(ch, st):
+            o = ord(ch)
+            if 0x2E80 <= o <= 0x9FFF or 0xFF00 <= o <= 0xFFEF or 0x3000 <= o <= 0x303F:
+                return st.size
+            return st.size * 0.5
+        return approx
+
     # ------------------------------------------------ 布局
     def layout(self, adv_fn=None):
-        """断行 + 基线（adv_fn(char, style) → advance，None 用字号近似）。"""
-        if adv_fn is None:
-            def adv_fn(ch, st):
-                o = ord(ch)
-                if 0x2E80 <= o <= 0x9FFF or 0xFF00 <= o <= 0xFFEF or 0x3000 <= o <= 0x303F:
-                    return st.size
-                return st.size * 0.5
+        """断行 + 基线（adv_fn(char, style) → advance，None 用已绑定度量或字号近似）。"""
+        adv_fn = self._measure(adv_fn)
+        wrap_w = None if self.auto_width else self.width
         self.visual = []
         baseline = self.first_baseline
+        max_w = 0.0
         for hi, hl in enumerate(self.hard_lines):
             if not hl:
                 self.visual.append(VisualLine(hi, 0, 0, self.box_left, baseline))
@@ -91,7 +111,7 @@ class BoxBuffer:
             cur_w = 0.0
             for i, (ch, st) in enumerate(hl):
                 w = adv_fn(ch, st)
-                if cur_w + w > self.width + 0.01 and i > start:
+                if (wrap_w is not None and cur_w + w > wrap_w + 0.01 and i > start):
                     # 断行（尽量避免行尾空白）
                     end = i
                     while end > start and hl[end - 1][0].isspace():
@@ -102,6 +122,7 @@ class BoxBuffer:
                     self.visual.append(VisualLine(hi, start, end,
                                                   self.box_left, baseline,
                                                   seg_w))
+                    max_w = max(max_w, seg_w)
                     baseline += self.line_height
                     start = end
                     # 跳过断点处的空白
@@ -116,18 +137,25 @@ class BoxBuffer:
                 seg_w = sum(adv_fn(c, s) for c, s in hl[start:])
                 self.visual.append(VisualLine(hi, start, len(hl),
                                               self.box_left, baseline, seg_w))
+                max_w = max(max_w, seg_w)
             baseline += self.line_height  # 硬换行额外行距
+        if self.auto_width:
+            self.width = max(self.min_width, max_w)
 
     def bbox(self) -> tuple:
-        """缓冲内容包围盒（含底部）。"""
+        """缓冲内容包围盒（含底部）。锁定宽度时框宽取 wrap 宽，否则随最长行。"""
+        pad = max(2.0, self.line_height * 0.06)
         if not self.visual:
-            return (self.box_left, self.first_baseline - self.line_height,
-                    self.box_left + self.width, self.first_baseline)
+            return (self.box_left - pad,
+                    self.first_baseline - self.line_height,
+                    self.box_left + self.width + pad, self.first_baseline)
         last = self.visual[-1]
         top = self.visual[0].baseline - self.line_height * 0.85
         bottom = last.baseline + self.line_height * 0.35
-        right = max(self.box_left + max(v.width for v in self.visual), self.box_left + 20)
-        return (self.box_left, top, right, bottom)
+        content_w = max((v.width for v in self.visual), default=0.0)
+        box_w = self.width if not self.auto_width else max(content_w, self.min_width)
+        right = self.box_left + box_w
+        return (self.box_left - pad, top - pad * 0.3, right + pad, bottom + pad * 0.3)
 
     # ------------------------------------------------ 光标几何
     def cursor_pos(self, cursor: tuple, adv_fn=None) -> tuple:
@@ -135,12 +163,7 @@ class BoxBuffer:
         hl_idx, off = cursor
         if not (0 <= hl_idx < len(self.hard_lines)):
             return (self.box_left, self.first_baseline)
-        if adv_fn is None:
-            def adv_fn(ch, st):
-                o = ord(ch)
-                if 0x2E80 <= o <= 0x9FFF or 0xFF00 <= o <= 0xFFEF:
-                    return st.size
-                return st.size * 0.5
+        adv_fn = self._measure(adv_fn)
         hl = self.hard_lines[hl_idx]
         off = max(0, min(off, len(hl)))
         # 找到包含该偏移的可视行
@@ -157,12 +180,7 @@ class BoxBuffer:
 
     def hit_test(self, x: float, y: float, adv_fn=None) -> tuple:
         """页面坐标 → 光标 (硬行, 偏移)。"""
-        if adv_fn is None:
-            def adv_fn(ch, st):
-                o = ord(ch)
-                if 0x2E80 <= o <= 0x9FFF or 0xFF00 <= o <= 0xFFEF:
-                    return st.size
-                return st.size * 0.5
+        adv_fn = self._measure(adv_fn)
         # 垂直：最近可视行（基线带）
         best_v, best_d = None, None
         for v in self.visual:
@@ -364,7 +382,8 @@ class BoxBuffer:
         self.layout()
 
     def set_width(self, width: float):
-        self.width = max(20.0, width)
+        self.width = max(self.min_width, width)
+        self.auto_width = False
         self.layout()
 
     # ------------------------------------------------ 提交序列化
