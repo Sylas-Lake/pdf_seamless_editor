@@ -146,7 +146,8 @@ def test_bold_candidates_prefer_bold_file():
         assert os.path.basename(c[0]).lower() == "arialbd.ttf"
 
 
-def test_original_char_skips_unicode_cmap_false_negative():
+def test_cjk_char_not_forced_onto_uncoverable_font():
+    """has_glyph 假阴性时不能绑死原字体，否则 insert_text 会落成方块。"""
     tmp = os.path.join(tempfile.mkdtemp(prefix="pdf_font_"), "s.pdf")
     create_sample_pdf(tmp)
     doc = fitz.open(tmp)
@@ -165,11 +166,45 @@ def test_original_char_skips_unicode_cmap_false_negative():
     fonts_mod.covers = lambda font, text: False
     try:
         rf = oracle.char_font(st, ch)
-        assert rf.is_original, (ch, rf.source)
-        rf_new = oracle.char_font(st, "Q")
-        assert not rf_new.is_original, rf_new.source
+        assert rf.key not in ("helv", "tiro", "cour"), (ch, rf.key, rf.source)
     finally:
         fonts_mod.covers = real
+    doc.close()
+
+
+def test_times_style_cjk_does_not_use_latin():
+    from core.models import GlyphNode, TextBlock, TextLine, TextStyle
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 80), "Title", fontname="tiro", fontsize=16)
+    st = TextStyle(font_name="TimesNewRomanPSMT", size=16)
+    glyphs = [
+        GlyphNode("品", (72, 100, 88, 120), (72, 116), st),
+        GlyphNode("名", (88, 100, 104, 120), (88, 116), st),
+    ]
+    blk = TextBlock(0, (72, 100, 104, 120),
+                    [TextLine(0, (72, 100, 104, 120), 116, glyphs)])
+    resolver = FontResolver(doc)
+    oracle = FontOracle.from_block(resolver, page, blk)
+    for ch in "品名":
+        rf = oracle.char_font(st, ch)
+        assert rf.key not in ("helv", "tiro", "cour"), (ch, rf.key, rf.source)
+        assert fonts_mod.font_can_insert(rf, ch) or rf.key in ("china-s", "china-ss")
+    doc.close()
+
+
+def test_insert_runs_rewrites_helv_cjk():
+    from core.models import TextStyle
+    from core.fonts import ResolvedFont
+    doc = fitz.open()
+    page = doc.new_page()
+    st = TextStyle(font_name="TimesNewRomanPSMT", size=18)
+    rf = ResolvedFont("helv", fitz.Font("helv"), True, "复用原内置字体资源")
+    executor.insert_runs(page, [("品 名", st, 72, 140, rf)], FontResolver(doc))
+    text = page.get_text().replace("\n", "")
+    assert "品" in text and "名" in text, text
+    names = [info[4] for info in page.get_fonts(full=True)]
+    assert "china-s" in names or "china-ss" in names
     doc.close()
 
 

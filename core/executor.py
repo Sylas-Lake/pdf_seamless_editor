@@ -68,7 +68,7 @@ def insert_runs(page, runs: Sequence, resolver):
     for text, style, x, baseline, rf in runs:
         if not text:
             continue
-        key = resolver.ensure_page_font(page, rf)
+        key = resolver.insert_fontname(page, rf, text, style)
         kwargs = {
             "fontname": key,
             "fontsize": style.size,

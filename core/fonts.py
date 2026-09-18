@@ -99,6 +99,59 @@ def _has_cjk(text: str) -> bool:
     return False
 
 
+_LATIN_KEYS = {"helv", "tiro", "cour", "symb", "zadb"}
+_CJK_IDENT = {
+    "simsun", "nsimsun", "simhei", "microsoftyahei", "kaiti", "fangsong",
+    "dengxian", "sourcehansans", "sourcehanserif", "notosanscjk",
+    "notoserifcjk",
+}
+_CJK_NAME_HINTS = (
+    "simsun", "nsimsun", "simhei", "simkai", "simfang", "yahei", "msyh",
+    "sourcehan", "noto", "cjk", "dengxian", "songti", "heiti", "kaiti",
+    "fangsong", "china-", "japan", "korea", "mingliu", "pmingliu",
+    "msmincho", "msgothic", "malgun", "stkaiti", "stsong", "stheiti",
+)
+
+
+def _name_looks_cjk(name: str) -> bool:
+    n = name or ""
+    if any("\u4e00" <= c <= "\u9fff" for c in n):
+        return True
+    ident = font_identity_key(n)
+    if ident in _CJK_IDENT:
+        return True
+    low = n.lower()
+    return any(h in low for h in _CJK_NAME_HINTS)
+
+
+def _wants_cjk(style, text: str) -> bool:
+    return _has_cjk(text) or _name_looks_cjk(getattr(style, "font_name", "") or "")
+
+
+def cjk_builtin_key(style) -> str:
+    """insert_text 可用的内置 CJK fontname（衬线用 china-s）。"""
+    base = strip_subset_prefix(getattr(style, "font_name", "") or "")
+    flags = getattr(style, "flags", 0) or 0
+    serif = bool(flags & 4)
+    if not serif and base:
+        b = base.lower()
+        serif = b.endswith(("simsun", "song", "serif", "times", "宋体",
+                            "ming", "mincho")) or "song" in b
+    return "china-s" if serif else "china-ss"
+
+
+def font_can_insert(rf, text: str) -> bool:
+    """该解析结果能否用 insert_text 画 text（有 Unicode 字形，且中文不用 Base14）。"""
+    if rf is None or not text:
+        return False
+    if _has_cjk(text) and getattr(rf, "key", "") in _LATIN_KEYS:
+        return False
+    font = getattr(rf, "font", None)
+    if font is None:
+        return False
+    return covers(font, text)
+
+
 # ------------------------------------------------------- Windows 系统字体查找
 
 _FONT_DIR = None
@@ -301,6 +354,13 @@ class FontResolver:
         done.add(rf.key)
         return rf.key
 
+    def insert_fontname(self, page, rf, text, style) -> str:
+        """页面上真正用于 insert_text 的 fontname。中文绝不落到 helv。"""
+        key = self.ensure_page_font(page, rf)
+        if _has_cjk(text) and (key in _LATIN_KEYS or not font_can_insert(rf, text)):
+            return cjk_builtin_key(style)
+        return key
+
     def _extracted(self, xref):
         """按 xref 缓存 extract_font，避免每次按键解 10MB+ 子集。"""
         if xref in self._xref_cache:
@@ -392,7 +452,7 @@ class FontResolver:
         # 策略 C：内置替代字体（衬线/无衬线匹配）
         serif = bool(style.flags & 4) if style.flags else base.lower().endswith(("simsun", "song", "serif", "times", "宋体"))
         prefer = ["china-s", "china-ss"] if serif else ["china-ss", "china-s"]
-        if not _has_cjk(text):
+        if not _wants_cjk(style, text):
             prefer = ["helv", "china-ss"]
         for key in prefer:
             f = self._load_buffer(None, key)
@@ -434,7 +494,7 @@ class FontResolver:
 # ---------------------------------------------------------------- 字体决策器
 
 def original_chars_from_block(block) -> set:
-    """框内已出现的 (style.key, char)，重建时这些字不再做 Unicode cmap 检查。"""
+    """框内已出现的 (style.key, char)。"""
     out = set()
     for ln in getattr(block, "lines", []) or []:
         for g in getattr(ln, "glyphs", []) or []:
@@ -446,9 +506,8 @@ def original_chars_from_block(block) -> set:
 class FontOracle:
     """缓冲区编辑的字体决策器：为每个 (样式, 字符) 决定插入字体与 advance。
 
-    规则：优先复用该样式的原始字体（子集覆盖检查）；
-    新增字符若不在子集内，回退到替代字体——保证布局度量与提交渲染一致。
-    原框里已经画过的字：跳过 has_glyph(unicode)（CID 子集常无 Unicode cmap）。
+    优先复用原字体，但 insert_text 必须能编该字。CID 子集没有 Unicode cmap
+    时 has_glyph 为假，不能再强行用原字体，否则会落下 .notdef 方块。
     """
 
     def __init__(self, resolver, page, original_chars=None):
@@ -483,13 +542,7 @@ class FontOracle:
         if k in self._char_cache:
             return self._char_cache[k][0]
         rf = self.original_font(style)
-        from .fonts import covers
-        painted = (style.key, ch) in self._orig_chars
-        if rf is not None and painted:
-            # 这个字本来就用该样式画在页面上：相信原字体，不查 Unicode cmap
-            self._char_cache[k] = (rf, None)
-            return rf
-        if rf is None or rf.font is None or not covers(rf.font, ch):
+        if not font_can_insert(rf, ch):
             rf = self.resolver.resolve(self.page, style, ch)
         self._char_cache[k] = (rf, None)
         return rf
