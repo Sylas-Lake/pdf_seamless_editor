@@ -1,10 +1,10 @@
 """属性面板：样式继承展示、选区样式修改、溢出策略、保真状态。"""
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QColorDialog, QComboBox, QDoubleSpinBox,
-                               QFormLayout, QGroupBox, QLabel,
-                               QListWidget, QPushButton, QVBoxLayout,
-                               QWidget)
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QListWidget, QPushButton, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from core.fidelity import COLORS, LABELS
 
@@ -26,6 +26,8 @@ class PropertyPanel(QWidget):
         gb_style = QGroupBox("样式继承（光标处）")
         form = QFormLayout(gb_style)
         self.ed_font = QLabel("—")
+        self.ed_font.setWordWrap(True)
+        self.ed_font.setFont(QFont("Microsoft YaHei", 9))
         self.ed_font.setTextInteractionFlags(Qt.TextInteractionFlags.TextSelectableByMouse)
         self.sp_size = QDoubleSpinBox()
         self.sp_size.setRange(3.0, 96.0)
@@ -33,11 +35,28 @@ class PropertyPanel(QWidget):
         self.sp_size.setDecimals(1)
         self.btn_color = QPushButton()
         self.btn_color.setFixedHeight(24)
-        self.lb_flags = QLabel("—")
         form.addRow("字体：", self.ed_font)
         form.addRow("字号：", self.sp_size)
         form.addRow("颜色：", self.btn_color)
-        form.addRow("字形：", self.lb_flags)
+        flags_row = QWidget()
+        flags_lay = QHBoxLayout(flags_row)
+        flags_lay.setContentsMargins(0, 0, 0, 0)
+        flags_lay.setSpacing(6)
+        self.btn_bold = QToolButton()
+        self.btn_italic = QToolButton()
+        for btn, act_name in ((self.btn_bold, "act_bold"),
+                              (self.btn_italic, "act_italic")):
+            btn.setAutoRaise(True)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            btn.setFixedSize(28, 24)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            act = getattr(controller, act_name, None)
+            if act is not None:
+                btn.setDefaultAction(act)
+        flags_lay.addWidget(self.btn_bold)
+        flags_lay.addWidget(self.btn_italic)
+        flags_lay.addStretch(1)
+        form.addRow("字形：", flags_row)
         self.btn_apply = QPushButton("应用样式到选区")
         self.btn_apply.clicked.connect(self._apply)
         form.addRow(self.btn_apply)
@@ -92,16 +111,10 @@ class PropertyPanel(QWidget):
         if style is None:
             self.ed_font.setText("—")
             return
-        self.ed_font.setText(style.font_name or "（默认）")
+        self.ed_font.setText(style.display_name or style.font_name or "（默认）")
         self.sp_size.setValue(round(style.size, 1))
         self._color = style.color
         self._update_color_btn()
-        flags = []
-        if style.is_bold:
-            flags.append("粗体")
-        if style.is_italic:
-            flags.append("斜体")
-        self.lb_flags.setText("、".join(flags) if flags else "常规")
 
     def update_selection(self, n_chars, n_lines):
         self.lb_sel.setText(f"选区：{n_chars} 字符 / {n_lines} 行"

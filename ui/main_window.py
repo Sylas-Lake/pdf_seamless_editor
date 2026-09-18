@@ -10,7 +10,7 @@ import os
 import tempfile
 from types import SimpleNamespace
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QEvent
 from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListView,
@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout,
                                QMessageBox, QToolButton, QVBoxLayout, QWidget)
 
 from core.compat import fitz
-from core import executor, verifier
+from core import executor, render, verifier
 from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
 from core.extractor import extract_page, line_redact_rects
 from core.fidelity import PageFidelity, worse
@@ -28,7 +28,7 @@ from core.textbox import BoxBuffer
 from ui.chrome import ChromeBar
 from ui.diff_dialog import DiffDialog
 from ui.icons import make_icon
-from ui.page_canvas import PageCanvas
+from ui.page_canvas import PageCanvas, local_pdf_paths
 from ui.property_panel import PropertyPanel
 from ui.session import EditSession
 from ui.stage import StageHost
@@ -97,6 +97,14 @@ class MainWindow(QMainWindow):
         self.act_paste = _act("粘贴", "Ctrl+V", self.paste, "paste")
         self.act_selall = _act("全选", "Ctrl+A", self.session_select_all, "select_all",
                               "全选（框内，Ctrl+A）")
+        self.act_bold = _act("粗体", "Ctrl+B",
+                             lambda: self.apply_emphasis(bold=self.act_bold.isChecked()),
+                             "bold", "粗体（Ctrl+B）")
+        self.act_bold.setCheckable(True)
+        self.act_italic = _act("斜体", "Ctrl+I",
+                               lambda: self.apply_emphasis(italic=self.act_italic.isChecked()),
+                               "italic", "斜体（Ctrl+I）")
+        self.act_italic.setCheckable(True)
         self.act_zoom_out = _act("缩小", "Ctrl+-", lambda: self.set_zoom(self.zoom / 1.15),
                                 "zoom_out")
         self.act_zoom_in = _act("放大", "Ctrl+=", lambda: self.set_zoom(self.zoom * 1.15),
@@ -200,6 +208,9 @@ class MainWindow(QMainWindow):
         self.chrome.add_item(_btn(self.act_undo))
         self.chrome.add_item(_btn(self.act_redo))
         self.chrome.add_sep()
+        self.chrome.add_item(_btn(self.act_bold))
+        self.chrome.add_item(_btn(self.act_italic))
+        self.chrome.add_sep()
         self.chrome.add_item(_btn(self.act_zoom_out))
         self.lb_zoom = _label("100%", 44)
         self.chrome.add_item(self.lb_zoom)
@@ -227,8 +238,42 @@ class MainWindow(QMainWindow):
         self.menuBar().hide()
         self.statusBar().hide()
 
-        self.canvas.set_hint("打开 PDF 后：单击选中文本框，双击进入编辑；图片可拖动/缩放/旋转")
+        self.canvas.set_hint("")
+        self.canvas.set_empty_prompt(True)
+        for w in (self.chrome, self.stage, self.pane_thumbs, self.pane_props,
+                  self.thumb_list, self.panel):
+            w.setAcceptDrops(True)
+            w.installEventFilter(self)
+        self.setAcceptDrops(True)
         self._update_undo_actions()
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+            paths = local_pdf_paths(getattr(ev, "mimeData", lambda: None)())
+            if paths:
+                if t == QEvent.Type.Drop:
+                    self.open_file(paths[0])
+                ev.acceptProposedAction()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def dragEnterEvent(self, e):
+        if local_pdf_paths(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        self.dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        paths = local_pdf_paths(e.mimeData())
+        if not paths:
+            e.ignore()
+            return
+        self.open_file(paths[0])
+        e.acceptProposedAction()
 
     def _sync_thumbs_action(self, on):
         self.act_thumbs.blockSignals(True)
@@ -264,6 +309,9 @@ class MainWindow(QMainWindow):
         self._load_doc(doc, path)
 
     def _load_doc(self, doc, path):
+        if self.session is not None:
+            self.commit_session()
+        old = self.doc
         self.doc = doc
         self.doc_path = path
         self.resolver = FontResolver(doc)
@@ -273,6 +321,9 @@ class MainWindow(QMainWindow):
         self.session = None
         self.selected_block = None
         self.selected_image = None
+        # 换文档后页码常仍是 0，且画布还挂着上一份的 model，必须让 set_page 重新渲染
+        self.page_no = -1
+        self.canvas.model = None
         perm = getattr(fitz, "PDF_PERM_MODIFY", 4)
         self._can_modify = (not doc.is_encrypted) or bool(doc.permissions & perm)
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_TITLE}")
@@ -281,6 +332,11 @@ class MainWindow(QMainWindow):
         self.chrome.relayout()
         self.set_page(0)
         self._build_thumbs()
+        if old is not None and old is not doc:
+            try:
+                old.close()
+            except Exception:
+                pass
         self.status_hint("编辑直接修改内容流（真删除，非遮盖）；撤销为字节级原版恢复")
 
     def current_page(self):
@@ -301,7 +357,8 @@ class MainWindow(QMainWindow):
         if self.session is not None:
             self.commit_session()
         i = max(0, min(i, self.doc.page_count - 1))
-        if i == self.page_no and self.canvas.model is not None:
+        if (i == self.page_no and self.canvas.model is not None
+                and self.canvas.model is self.models.get(i)):
             if edge:
                 self.canvas.scroll_to_edge(edge)
             return
@@ -333,6 +390,9 @@ class MainWindow(QMainWindow):
         dpr = self.devicePixelRatioF() or 1.0
         z = self.zoom * dpr
         pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+        model = self.models.get(self.page_no)
+        if model is not None:
+            render.fill_blank_cjk_glyphs(pix, z, model)
         img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                      QImage.Format.Format_RGB888).copy()
         img.setDevicePixelRatio(z)
@@ -428,7 +488,7 @@ class MainWindow(QMainWindow):
         self.selected_image = None
         sess.cursor = (0, 0)
         self.canvas.refresh_overlays()
-        self.canvas._grab_focus()
+        self.canvas.prepare_ime()
         self.status_hint("编辑中：单击定位，拖选/双击选词，Enter 换行，Esc 取消，点击框外提交")
         self._update_panels()
 
@@ -450,7 +510,7 @@ class MainWindow(QMainWindow):
                 sess.oracle.page = self.doc[page_index]
                 self._refresh_render_only()
             self.canvas.refresh_overlays()
-            self.canvas._grab_focus()
+            self.canvas.prepare_ime()
             self._update_panels()
             return
         runs = sess.buffer.commit_runs(sess.oracle)
@@ -461,7 +521,7 @@ class MainWindow(QMainWindow):
         sess.previewed = True
         self._refresh_render_only()
         self.canvas.refresh_overlays()
-        self.canvas._grab_focus()
+        self.canvas.prepare_ime()
         self._update_panels()
 
     def commit_session(self):
@@ -780,6 +840,58 @@ class MainWindow(QMainWindow):
         cmd.edit_rects = line_redact_rects(block) + [buffer.bbox()]
         self._register_cmd(cmd, buffer, runs)
 
+    def apply_emphasis(self, *, bold=None, italic=None):
+        """粗体/斜体开关：会话内改缓冲，否则整框重建。"""
+        if bold is None and italic is None:
+            return
+        if not self._editable():
+            self._sync_emphasis_actions()
+            return
+        if self.session is not None:
+            self.session.buffer.apply_style(
+                bold=bold, italic=italic, selection=self.session.selection)
+            self._sync_session_preview()
+            self.status_hint("已应用字形")
+            self._sync_emphasis_actions()
+            return
+        block = self.selected_block
+        if block is None:
+            self.status_hint("请先选中文本框或进入编辑")
+            self._sync_emphasis_actions()
+            return
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        buffer = BoxBuffer(block)
+        oracle = FontOracle.from_block(self.resolver, page, block)
+        buffer.overflow = self._overflow_strategy
+        buffer.set_measure(oracle.adv_fn())
+        buffer.apply_style(bold=bold, italic=italic, selection=None)
+        executor.remove_text_region(page, line_redact_rects(block))
+        runs = buffer.commit_runs(oracle)
+        executor.insert_runs(page, runs, self.resolver)
+        after = capture_page_state(self.doc, page)
+        if bold is True:
+            title = "粗体"
+        elif bold is False:
+            title = "取消粗体"
+        elif italic is True:
+            title = "斜体"
+        else:
+            title = "取消斜体"
+        cmd = PageStateCommand(title, self.page_no, before, after)
+        cmd.edit_rects = line_redact_rects(block) + [buffer.bbox()]
+        self._register_cmd(cmd, buffer, runs)
+        self._sync_emphasis_actions()
+
+    def _sync_emphasis_actions(self):
+        st = self.current_style()
+        for act, on in (
+                (self.act_bold, bool(st is not None and st.is_bold)),
+                (self.act_italic, bool(st is not None and st.is_italic))):
+            act.blockSignals(True)
+            act.setChecked(on)
+            act.blockSignals(False)
+
     def status_hint(self, msg):
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.set_hint(msg or "")
@@ -1082,6 +1194,7 @@ class MainWindow(QMainWindow):
 
     def _update_panels(self):
         self.panel.update_style(self.current_style())
+        self._sync_emphasis_actions()
         sess = self.session
         if sess is not None:
             n = sess.buffer.char_count()

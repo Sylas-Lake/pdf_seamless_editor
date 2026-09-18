@@ -9,6 +9,7 @@ import io
 from collections.abc import Iterable, Sequence
 
 from .compat import fitz
+from .fonts import insert_emphasis
 from .types import PdfRect
 
 try:
@@ -74,15 +75,13 @@ def insert_runs(page, runs: Sequence, resolver):
             "fontsize": style.size,
             "color": style.color,
         }
-        rm = getattr(style, "render_mode", 0) or 0
+        rm, bw, shear = insert_emphasis(style, rf, key)
         if rm:
             kwargs["render_mode"] = rm
-            kwargs["border_width"] = getattr(style, "border_width", 0.05) or 0.05
-        name = (getattr(style, "font_name", "") or "").lower()
-        if (getattr(style, "is_italic", False)
-                and "italic" not in name and "oblique" not in name):
+            kwargs["border_width"] = bw
+        if shear:
             kwargs["morph"] = (fitz.Point(x, baseline),
-                               fitz.Matrix(1, 0, 0.22, 1, 0, 0))
+                               fitz.Matrix(1, 0, shear, 1, 0, 0))
         page.insert_text(fitz.Point(x, baseline), text, **kwargs)
 
 

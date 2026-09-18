@@ -8,6 +8,7 @@
 from dataclasses import dataclass
 
 from .extractor import char_kind
+from .fonts import set_style_bold, set_style_italic
 from .models import TextBlock, TextStyle
 
 
@@ -449,9 +450,10 @@ class BoxBuffer:
                     return self.hard_lines[j][0][1].copy()
         return TextStyle()
 
-    def apply_style(self, size=None, color=None, selection=None):
-        """把字号/颜色应用到选区；无选区则整框。"""
-        if size is None and color is None:
+    def apply_style(self, size=None, color=None, selection=None,
+                    bold=None, italic=None):
+        """把字号/颜色/粗斜体应用到选区；无选区则整框。"""
+        if size is None and color is None and bold is None and italic is None:
             return
         if selection:
             ranges = self.selection_range(*selection)
@@ -468,6 +470,10 @@ class BoxBuffer:
                         st.border_width = max(0.15, st.size * 0.035)
                 if color is not None:
                     st.color = tuple(color)
+                if bold is not None:
+                    st = set_style_bold(st, bool(bold))
+                if italic is not None:
+                    st = set_style_italic(st, bool(italic))
                 hl[i] = (ch, st)
         self._style_dirty = True
         self.layout()

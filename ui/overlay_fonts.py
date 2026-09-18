@@ -74,7 +74,10 @@ def family_for_rf(rf: ResolvedFont) -> str:
 
 def fallback_family(style) -> str:
     """兜底字体族（CJK 优先微软雅黑，其他 Arial）。"""
-    name = (style.font_name or "") if style else ""
+    name = " ".join([
+        (style.font_name or "") if style else "",
+        getattr(style, "display_name", "") or "",
+    ])
     low = name.lower()
     if any(k in low for k in ("hei", "yahei", "sans", "simhei", "gothic")):
         return "Microsoft YaHei"
