@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-seamless-editor"
+version = "0.2.0"
+description = "PDF 无感编辑器：文本框编辑 + 内容流局部重写"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMuPDF>=1.24,<1.29",
+    "PySide6>=6.5,<6.12",
+    "Pillow>=10,<13",
+    "numpy>=1.24,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+pdf-seamless-editor = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["core", "ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+markers = [
+    "gui: 需要 Qt 界面（可用 QT_QPA_PLATFORM=offscreen）",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["core", "ui", "tests"]
+extend-exclude = ["_bootstrap", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"ui/theme.py" = ["E501"]
