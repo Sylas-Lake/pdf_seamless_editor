@@ -429,6 +429,11 @@ class MainWindow(QMainWindow):
         self.status_hint("编辑中：单击定位，拖选/双击选词，Enter 换行，Esc 取消，点击框外提交")
         self._update_panels()
 
+    def _restore_page(self, page_index, state):
+        restore_page_state(self.doc, self.doc[page_index], state)
+        if self.resolver is not None:
+            self.resolver.invalidate_page(page_index)
+
     def _sync_session_preview(self):
         """缓冲已变则按提交路径重写当前页并重绘；恢复未改动则还原原页。"""
         sess = self.session
@@ -437,11 +442,12 @@ class MainWindow(QMainWindow):
         page_index = sess.page_index
         if not sess.buffer.changed:
             if sess.previewed:
-                restore_page_state(self.doc, self.doc[page_index], sess.before_state)
+                self._restore_page(page_index, sess.before_state)
                 sess.previewed = False
                 sess.oracle.page = self.doc[page_index]
                 self._refresh_render_only()
             self.canvas.refresh_overlays()
+            self.canvas._grab_focus()
             self._update_panels()
             return
         runs = sess.buffer.commit_runs(sess.oracle)
@@ -452,6 +458,7 @@ class MainWindow(QMainWindow):
         sess.previewed = True
         self._refresh_render_only()
         self.canvas.refresh_overlays()
+        self.canvas._grab_focus()
         self._update_panels()
 
     def commit_session(self):
@@ -462,8 +469,7 @@ class MainWindow(QMainWindow):
         self.session_preedit_clear()
         if not sess.buffer.changed:
             if sess.previewed:
-                restore_page_state(self.doc, self.doc[sess.page_index],
-                                   sess.before_state)
+                self._restore_page(sess.page_index, sess.before_state)
                 self._refresh_page()
             else:
                 self.canvas.refresh_overlays()
@@ -489,8 +495,7 @@ class MainWindow(QMainWindow):
         self.session = None
         self.session_preedit_clear()
         if sess.previewed:
-            restore_page_state(self.doc, self.doc[sess.page_index],
-                               sess.before_state)
+            self._restore_page(sess.page_index, sess.before_state)
             self._refresh_page()
         else:
             self.canvas.refresh_overlays()

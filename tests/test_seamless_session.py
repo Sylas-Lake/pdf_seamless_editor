@@ -212,3 +212,62 @@ def test_second_insert_runs_changes_bytes():
     after_double = capture_page_state(doc, page)
     assert after_preview["contents"] != after_double["contents"]
     doc.close()
+
+
+def _embedded_doc():
+    """嵌入非内置 fontname 的 PDF（复现 restore 后 _page_keys 失效）。"""
+    doc = fitz.open()
+    page = doc.new_page()
+    buf = fitz.Font("china-s").buffer
+    assert buf, "内置 CJK 字体无 buffer，无法构造嵌入字体用例"
+    page.insert_font(fontname="F0", fontbuffer=buf)
+    page.insert_text((72, 100), "合同编号ABC", fontname="F0", fontsize=12)
+    return doc
+
+
+def test_embedded_font_preview_twice():
+    doc = _embedded_doc()
+    resolver = FontResolver(doc)
+    page = doc[0]
+    model = extract_page(page, 0)
+    blk = model.blocks[0]
+    before = capture_page_state(doc, page)
+    buf = BoxBuffer(blk)
+    oracle = FontOracle(resolver, page)
+    buf.set_measure(oracle.adv_fn())
+    buf.insert((0, 0), "X")
+    runs = buf.commit_runs(oracle)
+    assert any(rf.key not in ("china-s", "helv") for _t, _s, _x, _b, rf in runs)
+    page = executor.apply_box_rebuild(
+        doc, 0, before, _exp(blk.bbox, 0.6), runs, resolver)
+    assert "X合同编号ABC" in page.get_text().replace("\n", "")
+    buf.insert((0, 1), "Y")
+    runs = buf.commit_runs(oracle)
+    page = executor.apply_box_rebuild(
+        doc, 0, before, _exp(blk.bbox, 0.6), runs, resolver)
+    text = page.get_text().replace("\n", "")
+    assert "XY合同编号ABC" in text, text
+    doc.close()
+
+
+def test_ensure_page_font_survives_restore():
+    doc = _embedded_doc()
+    resolver = FontResolver(doc)
+    page = doc[0]
+    model = extract_page(page, 0)
+    blk = model.blocks[0]
+    before = capture_page_state(doc, page)
+    buf = BoxBuffer(blk)
+    oracle = FontOracle(resolver, page)
+    buf.set_measure(oracle.adv_fn())
+    buf.insert((0, 0), "X")
+    runs = buf.commit_runs(oracle)
+    page = executor.apply_box_rebuild(
+        doc, 0, before, _exp(blk.bbox, 0.6), runs, resolver)
+    from core.snapshot import restore_page_state
+    restore_page_state(doc, page, before)
+    page = doc[0]
+    # 故意不清缓存：ensure_page_font 必须自己发现字体已不在页面上
+    executor.insert_runs(page, runs, resolver)
+    assert "X" in page.get_text()
+    doc.close()

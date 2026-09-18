@@ -68,6 +68,7 @@ def apply_box_rebuild(doc, page_index: int, before_state, rect: PdfRect,
     page = doc[page_index]
     restore_page_state(doc, page, before_state)
     page = doc[page_index]
+    resolver.invalidate_page(page_index)
     remove_text_region(page, rect)
     insert_runs(page, runs, resolver)
     return doc[page_index]

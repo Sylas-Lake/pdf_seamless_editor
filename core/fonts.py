@@ -179,17 +179,34 @@ class FontResolver:
         self._by_file[path] = key
         return key
 
+    def invalidate_page(self, page_index: int):
+        """页面字节被还原后调用：缓存的 fontname 可能已不在页面资源里。"""
+        self._page_keys.pop(page_index, None)
+
+    def _font_on_page(self, page, key: str) -> bool:
+        try:
+            for info in page.get_fonts(full=True):
+                if len(info) > 4 and info[4] == key:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def ensure_page_font(self, page, rf: ResolvedFont) -> str:
-        """把解析出的字体注册进页面资源（幂等），返回可用 fontname。"""
+        """把解析出的字体注册进页面资源（幂等），返回可用 fontname。
+
+        不以内存缓存为准：restore 会撤掉页面字体，必须看见资源里真有该名才跳过。
+        """
         if rf.key in BUILTIN_KEYS:
             return rf.key
         spec = self._reg.get(rf.key)
         if not spec:
             return "helv"
         done = self._page_keys.setdefault(page.number, set())
-        if rf.key not in done:
-            page.insert_font(fontname=rf.key, **spec)
-            done.add(rf.key)
+        if rf.key in done and self._font_on_page(page, rf.key):
+            return rf.key
+        page.insert_font(fontname=rf.key, **spec)
+        done.add(rf.key)
         return rf.key
 
     # -- 解析 --

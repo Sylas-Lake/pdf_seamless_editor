@@ -41,17 +41,22 @@ class PageStateCommand(Command):
     def _page(self, ctx):
         return ctx.doc[self.page_index]
 
+    def _restore(self, ctx, state):
+        page = self._page(ctx)
+        restore_page_state(ctx.doc, page, state, self.page_index)
+        resolver = getattr(ctx, "resolver", None)
+        if resolver is not None:
+            resolver.invalidate_page(self.page_index)
+
     def apply(self, ctx):
         if not self._applied:
             self._applied = True
             return []
-        page = self._page(ctx)
-        restore_page_state(ctx.doc, page, self.after, self.page_index)
+        self._restore(ctx, self.after)
         return []
 
     def undo(self, ctx):
-        page = self._page(ctx)
-        restore_page_state(ctx.doc, page, self.before, self.page_index)
+        self._restore(ctx, self.before)
         return []
 
 
