@@ -2,16 +2,12 @@
 import math
 import unicodedata
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
-
 from .models import (GlyphNode, ImageObject, PageModel, TextBlock,
                      TextLine, TextStyle)
+from .types import PdfRect
 
 
-def _int_to_rgb(v: int) -> tuple:
+def _int_to_rgb(v: int) -> tuple[float, float, float]:
     v = int(v) & 0xFFFFFF
     return ((v >> 16) & 255) / 255.0, ((v >> 8) & 255) / 255.0, (v & 255) / 255.0
 
@@ -40,12 +36,12 @@ def char_kind(ch: str) -> str:
     return "punct"
 
 
-def union_bbox(boxes) -> tuple:
+def union_bbox(boxes: list[PdfRect]) -> PdfRect:
     return (min(b[0] for b in boxes), min(b[1] for b in boxes),
             max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
-def iou(a: tuple, b: tuple) -> float:
+def iou(a: PdfRect, b: PdfRect) -> float:
     ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
     ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
     if ix1 <= ix0 or iy1 <= iy0:

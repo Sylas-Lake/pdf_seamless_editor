@@ -5,9 +5,9 @@
 - 布局（断行 + 基线）由 advance 度量回调驱动，与 PDF 提交度量一致；
 - 提交时整体重建（一次 redact + 按行插入），撤销通过页面快照字节级恢复。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from .extractor import char_kind, n_grapheme_clusters
+from .extractor import char_kind
 from .models import TextBlock, TextStyle
 
 

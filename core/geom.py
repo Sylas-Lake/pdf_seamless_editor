@@ -4,12 +4,18 @@ QRectF 的四参数构造是 (x, y, width, height)，不能直接 * 解包 PDF b
 """
 
 
-def qrect_args(rect):
+from __future__ import annotations
+
+from .types import PdfRect
+
+
+def qrect_args(rect: PdfRect) -> tuple[float, float, float, float]:
     """PDF xyxy → QRectF(x, y, w, h) 四元组。"""
     return (rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1])
 
 
-def resize_rect(rect, mode, x, y, *, keep_aspect=False, min_size=8.0):
+def resize_rect(rect: PdfRect, mode: str, x: float, y: float, *,
+                keep_aspect: bool = False, min_size: float = 8.0) -> PdfRect:
     """按手柄模式缩放轴对齐矩形。
 
     rect: (x0, y0, x1, y1)
