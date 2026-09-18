@@ -9,28 +9,13 @@ import math
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
-from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QPainter, QPen)
-from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsItem,
-                               QGraphicsPixmapItem, QGraphicsScene,
-                               QGraphicsView, QMenu)
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsPixmapItem,
+                               QGraphicsScene, QGraphicsView, QMenu)
 
 from core.geom import qrect_args, resize_rect
-
-ACCENT = QColor(21, 101, 192)
-CORNERS = ("nw", "ne", "se", "sw")
-
-_HANDLE_CURSORS = {
-    "n": Qt.CursorShape.SizeVerCursor,
-    "s": Qt.CursorShape.SizeVerCursor,
-    "e": Qt.CursorShape.SizeHorCursor,
-    "w": Qt.CursorShape.SizeHorCursor,
-    "nw": Qt.CursorShape.SizeFDiagCursor,
-    "se": Qt.CursorShape.SizeFDiagCursor,
-    "ne": Qt.CursorShape.SizeBDiagCursor,
-    "sw": Qt.CursorShape.SizeBDiagCursor,
-    "rot": Qt.CursorShape.CrossCursor,
-    "move": Qt.CursorShape.SizeAllCursor,
-}
+from ui.box_editor import BoxEditorItem
+from ui.handles import CORNERS, HANDLE_CURSORS, HandleLayer
 
 
 def to_qrect(xyxy) -> QRectF:
@@ -41,253 +26,6 @@ def to_qrect(xyxy) -> QRectF:
 
 def qrect_xyxy(r: QRectF) -> tuple:
     return (r.left(), r.top(), r.right(), r.bottom())
-
-
-class HandleLayer(QGraphicsItem):
-    """选中对象控制层。mode: "image"（8点+旋转）/ "box"（左右调宽）。"""
-
-    def __init__(self, canvas):
-        super().__init__()
-        self.canvas = canvas
-        self.rect = QRectF()
-        self.deg = 0.0
-        self.mode = "image"
-        self.setVisible(False)
-        self.setZValue(50)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-
-    def set_state(self, rect: QRectF, deg=0.0, mode=None):
-        self.prepareGeometryChange()
-        self.rect = QRectF(rect)
-        self.deg = deg
-        if mode:
-            self.mode = mode
-        self.setVisible(True)
-        self.update()
-
-    def hide_layer(self):
-        self.setVisible(False)
-
-    def _z(self):
-        return max(self.canvas.zoom, 0.05)
-
-    def boundingRect(self):
-        m = 40.0 / self._z()
-        return self.rect.adjusted(-m, -m, m, m)
-
-    def _local_points(self):
-        r = self.rect
-        cx = (r.left() + r.right()) / 2
-        cy = (r.top() + r.bottom()) / 2
-        if self.mode == "box":
-            return {"w": (r.left(), cy), "e": (r.right(), cy)}
-        pts = {"nw": (r.left(), r.top()), "n": (cx, r.top()),
-               "ne": (r.right(), r.top()), "e": (r.right(), cy),
-               "se": (r.right(), r.bottom()), "s": (cx, r.bottom()),
-               "sw": (r.left(), r.bottom()), "w": (r.left(), cy)}
-        pts["rot"] = (cx, r.top() - 32.0 / self._z())
-        return pts
-
-    def _to_local(self, sp: QPointF) -> QPointF:
-        if self.mode == "image" and abs(self.deg) > 0.5:
-            c = self.rect.center()
-            rad = math.radians(-self.deg)
-            dx, dy = sp.x() - c.x(), sp.y() - c.y()
-            ca, sa = math.cos(rad), math.sin(rad)
-            return QPointF(c.x() + dx * ca - dy * sa,
-                           c.y() + dx * sa + dy * ca)
-        return QPointF(sp)
-
-    def _to_world(self, x, y):
-        if self.mode == "image" and abs(self.deg) > 0.5:
-            c = self.rect.center()
-            rad = math.radians(self.deg)
-            dx, dy = x - c.x(), y - c.y()
-            ca, sa = math.cos(rad), math.sin(rad)
-            return (c.x() + dx * ca - dy * sa, c.y() + dx * sa + dy * ca)
-        return (x, y)
-
-    def corner_points(self):
-        return {name: self._to_world(x, y)
-                for name, (x, y) in self._local_points().items()}
-
-    def hit_handle(self, sp: QPointF):
-        if not self.isVisible():
-            return None
-        p = self._to_local(sp)
-        z = self._z()
-        corner_tol = 14.0 / z
-        edge_tol = 8.0 / z
-        rot_tol = 12.0 / z
-        r = self.rect
-        pts = self._local_points()
-
-        if "rot" in pts:
-            hx, hy = pts["rot"]
-            if abs(p.x() - hx) <= rot_tol and abs(p.y() - hy) <= rot_tol:
-                return "rot"
-
-        for name in CORNERS:
-            if name not in pts:
-                continue
-            hx, hy = pts[name]
-            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
-                return name
-
-        if self.mode == "image":
-            inside_x = r.left() - edge_tol <= p.x() <= r.right() + edge_tol
-            inside_y = r.top() - edge_tol <= p.y() <= r.bottom() + edge_tol
-            if inside_x and abs(p.y() - r.top()) <= edge_tol:
-                return "n"
-            if inside_x and abs(p.y() - r.bottom()) <= edge_tol:
-                return "s"
-            if inside_y and abs(p.x() - r.right()) <= edge_tol:
-                return "e"
-            if inside_y and abs(p.x() - r.left()) <= edge_tol:
-                return "w"
-            if r.contains(p):
-                return "move"
-            return None
-
-        for name in ("w", "e"):
-            hx, hy = pts[name]
-            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
-                return name
-        if r.contains(p):
-            return "move"
-        return None
-
-    def paint(self, painter, option, widget):
-        z = self._z()
-        s = 10.0 / z
-        painter.setPen(QPen(ACCENT, 0, Qt.PenStyle.DashLine))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self.deg and self.mode == "image":
-            painter.save()
-            painter.translate(self.rect.center())
-            painter.rotate(self.deg)
-            painter.drawRect(QRectF(-self.rect.width() / 2, -self.rect.height() / 2,
-                                    self.rect.width(), self.rect.height()))
-            painter.restore()
-        else:
-            painter.drawRect(self.rect)
-        painter.setPen(QPen(ACCENT, 0))
-        for name, (hx, hy) in self.corner_points().items():
-            if name == "rot":
-                painter.setBrush(QBrush(ACCENT))
-                painter.drawEllipse(QPointF(hx, hy), s * 0.7, s * 0.7)
-                tx, ty = self._to_world(self.rect.center().x(), self.rect.top())
-                painter.drawLine(QPointF(tx, ty), QPointF(hx, hy))
-            else:
-                painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
-                painter.drawRect(QRectF(hx - s / 2, hy - s / 2, s, s))
-
-
-class BoxEditorItem(QGraphicsItem):
-    """文本框编辑覆盖层：实时渲染缓冲内容、光标、选区、输入法预编辑。"""
-
-    def __init__(self, canvas):
-        super().__init__()
-        self.canvas = canvas
-        self.setZValue(40)
-        self.setVisible(False)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._blink_on = True
-        self._font_cache = {}
-
-    # ------------------------------------------------ 绘制
-    def boundingRect(self):
-        sess = self.canvas.controller.session
-        if sess is None:
-            return QRectF()
-        bb = sess.buffer.bbox()
-        m = 12.0
-        return QRectF(bb[0] - m, bb[1] - m, (bb[2] - bb[0]) + 2 * m,
-                      (bb[3] - bb[1]) + 2 * m)
-
-    def _qfont(self, rf, st):
-        key = (getattr(rf, "key", ""), st.key)
-        if key not in self._font_cache:
-            from ui.overlay_fonts import qfont_for_style
-            self._font_cache[key] = qfont_for_style(rf, st)
-        return self._font_cache[key]
-
-    def paint(self, painter, option, widget):
-        c = self.canvas.controller
-        sess = c.session
-        if sess is None:
-            return
-        buf = sess.buffer
-        oracle = sess.oracle
-        adv = oracle.adv_fn()
-        lh = buf.line_height
-
-        # 框边界
-        bb = buf.bbox()
-        painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 160),
-                            0, Qt.PenStyle.DashLine))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(QRectF(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1]))
-
-        # 选区
-        if sess.selection:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(30, 120, 215, 70)))
-            for (hi, s, e) in buf.selection_range(*sess.selection):
-                for v in buf.visual:
-                    if v.hard_idx != hi or v.end <= v.start:
-                        continue
-                    s2 = max(s, v.start)
-                    e2 = min(e, v.end)
-                    if e2 <= s2:
-                        continue
-                    hl = buf.hard_lines[hi]
-                    x0 = v.x + sum(adv(*hl[i]) for i in range(v.start, s2))
-                    x1 = v.x + sum(adv(*hl[i]) for i in range(v.start, e2))
-                    painter.drawRect(QRectF(x0, v.baseline - lh * 0.78,
-                                            max(x1 - x0, 1.0), lh))
-
-        # 文本（逐字符按 PDF 度量定位）
-        for v in buf.visual:
-            hl = buf.hard_lines[v.hard_idx]
-            cx = v.x
-            for i in range(v.start, v.end):
-                ch, st = hl[i]
-                rf = oracle.char_font(st, ch)
-                painter.setFont(self._qfont(rf, st))
-                painter.setPen(QColor(int(st.color[0] * 255),
-                                      int(st.color[1] * 255),
-                                      int(st.color[2] * 255)))
-                painter.drawText(QPointF(cx, v.baseline), ch)
-                cx += oracle.advance(st, ch)
-
-        # 光标（屏幕约 2px，避免缩放过细看不见）
-        if self._blink_on and sess.preedit == "":
-            x, bl = buf.cursor_pos(sess.cursor, adv)
-            cw = max(1.2, 2.0 / max(self.canvas.zoom, 0.05))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(ACCENT))
-            painter.drawRect(QRectF(x - cw / 2, bl - lh * 0.78, cw, lh))
-
-        # 输入法预编辑
-        if sess.preedit:
-            st = buf.style_at(sess.cursor)
-            rf = oracle.char_font(st, "预")
-            f = self._qfont(rf, st)
-            painter.setFont(f)
-            painter.setPen(QPen(QColor(ACCENT)))
-            x, bl = buf.cursor_pos(sess.cursor, adv)
-            painter.drawText(QPointF(x, bl), sess.preedit)
-            fm = painter.fontMetrics()
-            w = fm.horizontalAdvance(sess.preedit)
-            painter.setBrush(QBrush(QColor(ACCENT)))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(QRectF(x, bl + 1.5, w, 1.2))
-
-    def blink(self):
-        self._blink_on = not self._blink_on
-        if self.isVisible():
-            self.update()
 
 
 class PageCanvas(QGraphicsView):
@@ -414,6 +152,25 @@ class PageCanvas(QGraphicsView):
             self.handle_layer.set_state(to_qrect(blk.bbox), 0.0, "box")
         else:
             self.handle_layer.hide_layer()
+
+    def try_turn_page(self, delta: int, from_edge: str) -> bool:
+        """公开页边翻页。delta=+1 下一页，-1 上一页。"""
+        self._last_page_turn = 0.0
+        return bool(self._try_page_turn(delta, from_edge))
+
+    def begin_handle_drag(self, handle: str, scene_pos: QPointF) -> None:
+        self._start_drag(handle, scene_pos)
+
+    def update_handle_drag(self, scene_pos: QPointF) -> None:
+        self._update_drag(scene_pos)
+
+    def drag_rect(self):
+        d = self._drag
+        return None if not d else d.get("cur_rect")
+
+    def cancel_handle_drag(self) -> None:
+        self._drag = None
+        self._refresh_handles()
 
     # ------------------------------------------------ 输入法
     def inputMethodEvent(self, e):
@@ -571,7 +328,7 @@ class PageCanvas(QGraphicsView):
             return
         hit = self.handle_layer.hit_handle(sp)
         if hit:
-            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+            self.viewport().setCursor(QCursor(HANDLE_CURSORS.get(
                 hit, Qt.CursorShape.ArrowCursor)))
             return
         x, y = sp.x(), sp.y()
@@ -682,7 +439,7 @@ class PageCanvas(QGraphicsView):
             self._drag = {"kind": "image", "mode": hit, "start_rect": QRectF(r),
                           "cur_rect": QRectF(r), "deg": img.deg, "corner": hit,
                           "start_pos": QPointF(sp), "img": img}
-            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+            self.viewport().setCursor(QCursor(HANDLE_CURSORS.get(
                 hit, Qt.CursorShape.SizeAllCursor)))
         elif blk is not None and self.handle_layer.mode == "box":
             r = to_qrect(blk.bbox)
@@ -773,7 +530,6 @@ class PageCanvas(QGraphicsView):
         c = self.controller
         mods = e.modifiers()
         ctrl = mods & Qt.KeyboardModifier.ControlModifier
-        shift = mods & Qt.KeyboardModifier.ShiftModifier
         key = e.key()
 
         # 选中图片：Delete 删除

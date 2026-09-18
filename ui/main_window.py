@@ -1,4 +1,4 @@
-"""主窗口 v2：文本框会话编辑控制器。
+"""主窗口：文本框会话编辑控制器。
 
 编辑模型（类 PPT）：
   - 单击文本框 → 选中（可拖动移动 / 左右手柄调宽）
@@ -10,213 +10,31 @@ import os
 import tempfile
 from types import SimpleNamespace
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
-
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QListView, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QSizePolicy,
-                               QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout,
+                               QInputDialog, QLabel, QLineEdit, QListView,
+                               QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QToolButton, QVBoxLayout, QWidget)
 
+from core.compat import fitz
 from core import executor, verifier
 from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
 from core.extractor import extract_page
 from core.fidelity import PageFidelity, worse
 from core.fonts import FontOracle, FontResolver
-from core.models import TextBlock
-from core.sample import create_sample_pdf
-from core.snapshot import (capture_page_state, restore_page_state,
-                           page_state_equal)
+from core.snapshot import (capture_page_state, restore_page_state)
 from core.textbox import BoxBuffer
+from ui.chrome import ChromeBar
 from ui.diff_dialog import DiffDialog
 from ui.icons import make_icon
 from ui.page_canvas import PageCanvas
 from ui.property_panel import PropertyPanel
+from ui.session import EditSession
+from ui.stage import StageHost
 from ui.theme import APP_QSS
 
 APP_TITLE = "PDF 无感编辑器 · 文本框编辑版"
-
-
-class StageHost(QWidget):
-    """页面铺满；左右侧栏都是可召唤抽屉。"""
-
-    left_toggled = Signal(bool)
-    RIGHT_W = 272
-    LEFT_W = 164
-
-    def __init__(self, canvas, left_drawer, right_drawer, parent=None):
-        super().__init__(parent)
-        self.canvas = canvas
-        self.left = left_drawer
-        self.right = right_drawer
-        self._left_open = False
-        self._right_open = False
-        self.setObjectName("RootSplit")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(240, 200)
-        canvas.setParent(self)
-        left_drawer.setParent(self)
-        right_drawer.setParent(self)
-        left_drawer.hide()
-        right_drawer.hide()
-
-    def set_left_open(self, on, *, emit=True):
-        on = bool(on)
-        if on == self._left_open:
-            return
-        self._left_open = on
-        self.left.setVisible(on)
-        self._layout_stage(center=True)
-        if emit:
-            self.left_toggled.emit(on)
-
-    def set_right_open(self, on):
-        on = bool(on)
-        if on == self._right_open:
-            return
-        self._right_open = on
-        self.right.setVisible(on)
-        self._layout_stage(center=True)
-
-    def toggle_left(self):
-        self.set_left_open(not self._left_open)
-
-    def toggle_right(self):
-        self.set_right_open(not self._right_open)
-
-    def toggle_drawer(self):
-        """兼容旧调用：切换右侧属性栏。"""
-        self.toggle_right()
-
-    def is_open(self):
-        return self._right_open
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._layout_stage(center=False)
-
-    def _layout_stage(self, center=False):
-        w, h = self.width(), self.height()
-        left = self.LEFT_W if self._left_open else 0
-        right = self.RIGHT_W if self._right_open else 0
-        self.canvas.setGeometry(left, 0, max(1, w - left - right), h)
-        if self._left_open:
-            self.left.setGeometry(0, 0, self.LEFT_W, h)
-            self.left.raise_()
-        if self._right_open:
-            self.right.setGeometry(max(0, w - self.RIGHT_W), 0, self.RIGHT_W, h)
-            self.right.raise_()
-        if center:
-            self.canvas.center_page()
-
-
-class ChromeBar(QWidget):
-    """图标栏：左右抽屉按钮贴边，其余图标以页码为几何中心。"""
-
-    BTN = 28
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("MainBar")
-        self.setFixedHeight(38)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._ends = []
-        self._items = []
-        self._pivot = None
-
-    def add_end(self, widget, side):
-        widget.setParent(self)
-        self._ends.append((widget, side))
-        return widget
-
-    def add_item(self, widget):
-        widget.setParent(self)
-        self._items.append(widget)
-        return widget
-
-    def add_sep(self):
-        line = QWidget(self)
-        line.setObjectName("BarSep")
-        line.setFixedSize(1, 16)
-        self._items.append(line)
-        return line
-
-    def set_pivot(self, widget):
-        self._pivot = widget
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self.relayout()
-
-    def showEvent(self, e):
-        super().showEvent(e)
-        self.relayout()
-
-    def _size_of(self, wid):
-        if isinstance(wid, QToolButton):
-            return self.BTN, self.BTN
-        if wid.objectName() == "BarSep":
-            return 1, 16
-        if isinstance(wid, QLabel):
-            return max(wid.minimumWidth(), wid.sizeHint().width()), 28
-        return max(wid.sizeHint().width(), 1), max(wid.sizeHint().height(), 1)
-
-    def relayout(self):
-        w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
-            return
-        gap, margin = 2, 6
-
-        def place(wid, x):
-            ww, hh = self._size_of(wid)
-            wid.setGeometry(int(x), (h - hh) // 2, int(ww), int(hh))
-            return ww
-
-        for wid, side in self._ends:
-            if side == "left":
-                place(wid, margin)
-            else:
-                ww, _ = self._size_of(wid)
-                place(wid, w - margin - ww)
-            wid.raise_()
-
-        pivot = self._pivot
-        if pivot is None or pivot not in self._items:
-            return
-        idx = self._items.index(pivot)
-        pw, _ = self._size_of(pivot)
-        px = (w - pw) // 2
-        place(pivot, px)
-
-        x = px
-        for item in reversed(self._items[:idx]):
-            iw, _ = self._size_of(item)
-            x -= gap + iw
-            place(item, x)
-
-        x = px + pw
-        for item in self._items[idx + 1:]:
-            x += gap
-            x += place(item, x)
-
-
-class EditSession:
-    """一次文本框编辑会话。"""
-
-    def __init__(self, block, page_index, buffer, before_state, oracle):
-        self.block = block
-        self.page_index = page_index
-        self.buffer = buffer
-        self.before_state = before_state
-        self.oracle = oracle
-        self.cursor = (0, 0)
-        self.selection = None      # (anchor, focus) 框内缓冲坐标
-        self.preedit = ""
 
 
 class MainWindow(QMainWindow):
@@ -468,8 +286,12 @@ class MainWindow(QMainWindow):
             return None
         return self.doc[self.page_no]
 
-    def _model(self):
+    def page_model(self):
+        """当前页的文本框/图片模型。"""
         return self.models.get(self.page_no)
+
+    def _model(self):
+        return self.page_model()
 
     def set_page(self, i, *, edge=None):
         if self.doc is None:
@@ -706,8 +528,6 @@ class MainWindow(QMainWindow):
         sess = self.session
         if sess is None:
             return
-        adv = sess.oracle.adv_fn()
-        pos = sess.buffer.hit_test(x, y, adv)
         # 找到所在可视行
         best_v, best_d = None, None
         for v in sess.buffer.visual:
@@ -1198,24 +1018,6 @@ class MainWindow(QMainWindow):
             self.act_redo.setText("重做")
 
     # ================================================== 其他
-    def make_sample(self):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "示例文档.pdf")
-        # 当前打开的正是这份文件时，Windows 会锁住无法覆盖
-        if self.doc is not None:
-            try:
-                self.doc.close()
-            except Exception:
-                pass
-            self.doc = None
-            self.doc_path = ""
-        try:
-            create_sample_pdf(path)
-        except Exception as e:
-            QMessageBox.critical(self, "生成失败", f"无法写出示例文档：{e}")
-            return
-        self.open_file(path)
-
     def show_fidelity_help(self):
         QMessageBox.information(
             self, "保真等级说明",
