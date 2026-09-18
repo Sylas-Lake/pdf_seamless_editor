@@ -102,6 +102,17 @@ QScrollBar::handle:vertical {
     border-radius: 4px;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    background: #2F3237;
+    height: 10px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: #5A616A;
+    min-width: 24px;
+    border-radius: 4px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QGraphicsView { background: #4B4F55; border: none; }
 QWidget#ThumbPane {
     background: #2F3237;

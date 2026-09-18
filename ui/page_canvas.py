@@ -3,33 +3,21 @@
 - 单击文本框 → 选中（可拖动/调宽）；双击 → 进入框内编辑
 - 框内编辑：光标/选区/输入法/换行全部基于内存缓冲，实时覆盖层渲染
 - 图片：8 控制点缩放（等比/自由）+ 旋转手柄 + 拖动
-- Ctrl+滚轮缩放
+- Ctrl+滚轮缩放；Shift+滚轮横向平移；滚轮在页边翻页
 """
 import math
+import os
+import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
-from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QPainter, QPen)
-from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsItem,
-                               QGraphicsPixmapItem, QGraphicsScene,
-                               QGraphicsView, QMenu)
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QEvent
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QGuiApplication,
+                           QPainter)
+from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsPixmapItem,
+                               QGraphicsScene, QGraphicsView, QLabel, QMenu)
 
 from core.geom import qrect_args, resize_rect
-
-ACCENT = QColor(21, 101, 192)
-CORNERS = ("nw", "ne", "se", "sw")
-
-_HANDLE_CURSORS = {
-    "n": Qt.CursorShape.SizeVerCursor,
-    "s": Qt.CursorShape.SizeVerCursor,
-    "e": Qt.CursorShape.SizeHorCursor,
-    "w": Qt.CursorShape.SizeHorCursor,
-    "nw": Qt.CursorShape.SizeFDiagCursor,
-    "se": Qt.CursorShape.SizeFDiagCursor,
-    "ne": Qt.CursorShape.SizeBDiagCursor,
-    "sw": Qt.CursorShape.SizeBDiagCursor,
-    "rot": Qt.CursorShape.CrossCursor,
-    "move": Qt.CursorShape.SizeAllCursor,
-}
+from ui.box_editor import BoxEditorItem
+from ui.handles import CORNERS, HANDLE_CURSORS, HandleLayer
 
 
 def to_qrect(xyxy) -> QRectF:
@@ -42,251 +30,21 @@ def qrect_xyxy(r: QRectF) -> tuple:
     return (r.left(), r.top(), r.right(), r.bottom())
 
 
-class HandleLayer(QGraphicsItem):
-    """选中对象控制层。mode: "image"（8点+旋转）/ "box"（左右调宽）。"""
-
-    def __init__(self, canvas):
-        super().__init__()
-        self.canvas = canvas
-        self.rect = QRectF()
-        self.deg = 0.0
-        self.mode = "image"
-        self.setVisible(False)
-        self.setZValue(50)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-
-    def set_state(self, rect: QRectF, deg=0.0, mode=None):
-        self.prepareGeometryChange()
-        self.rect = QRectF(rect)
-        self.deg = deg
-        if mode:
-            self.mode = mode
-        self.setVisible(True)
-        self.update()
-
-    def hide_layer(self):
-        self.setVisible(False)
-
-    def _z(self):
-        return max(self.canvas.zoom, 0.05)
-
-    def boundingRect(self):
-        m = 40.0 / self._z()
-        return self.rect.adjusted(-m, -m, m, m)
-
-    def _local_points(self):
-        r = self.rect
-        cx = (r.left() + r.right()) / 2
-        cy = (r.top() + r.bottom()) / 2
-        if self.mode == "box":
-            return {"w": (r.left(), cy), "e": (r.right(), cy)}
-        pts = {"nw": (r.left(), r.top()), "n": (cx, r.top()),
-               "ne": (r.right(), r.top()), "e": (r.right(), cy),
-               "se": (r.right(), r.bottom()), "s": (cx, r.bottom()),
-               "sw": (r.left(), r.bottom()), "w": (r.left(), cy)}
-        pts["rot"] = (cx, r.top() - 32.0 / self._z())
-        return pts
-
-    def _to_local(self, sp: QPointF) -> QPointF:
-        if self.mode == "image" and abs(self.deg) > 0.5:
-            c = self.rect.center()
-            rad = math.radians(-self.deg)
-            dx, dy = sp.x() - c.x(), sp.y() - c.y()
-            ca, sa = math.cos(rad), math.sin(rad)
-            return QPointF(c.x() + dx * ca - dy * sa,
-                           c.y() + dx * sa + dy * ca)
-        return QPointF(sp)
-
-    def _to_world(self, x, y):
-        if self.mode == "image" and abs(self.deg) > 0.5:
-            c = self.rect.center()
-            rad = math.radians(self.deg)
-            dx, dy = x - c.x(), y - c.y()
-            ca, sa = math.cos(rad), math.sin(rad)
-            return (c.x() + dx * ca - dy * sa, c.y() + dx * sa + dy * ca)
-        return (x, y)
-
-    def corner_points(self):
-        return {name: self._to_world(x, y)
-                for name, (x, y) in self._local_points().items()}
-
-    def hit_handle(self, sp: QPointF):
-        if not self.isVisible():
-            return None
-        p = self._to_local(sp)
-        z = self._z()
-        corner_tol = 14.0 / z
-        edge_tol = 8.0 / z
-        rot_tol = 12.0 / z
-        r = self.rect
-        pts = self._local_points()
-
-        if "rot" in pts:
-            hx, hy = pts["rot"]
-            if abs(p.x() - hx) <= rot_tol and abs(p.y() - hy) <= rot_tol:
-                return "rot"
-
-        for name in CORNERS:
-            if name not in pts:
-                continue
-            hx, hy = pts[name]
-            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
-                return name
-
-        if self.mode == "image":
-            inside_x = r.left() - edge_tol <= p.x() <= r.right() + edge_tol
-            inside_y = r.top() - edge_tol <= p.y() <= r.bottom() + edge_tol
-            if inside_x and abs(p.y() - r.top()) <= edge_tol:
-                return "n"
-            if inside_x and abs(p.y() - r.bottom()) <= edge_tol:
-                return "s"
-            if inside_y and abs(p.x() - r.right()) <= edge_tol:
-                return "e"
-            if inside_y and abs(p.x() - r.left()) <= edge_tol:
-                return "w"
-            if r.contains(p):
-                return "move"
-            return None
-
-        for name in ("w", "e"):
-            hx, hy = pts[name]
-            if abs(p.x() - hx) <= corner_tol and abs(p.y() - hy) <= corner_tol:
-                return name
-        if r.contains(p):
-            return "move"
-        return None
-
-    def paint(self, painter, option, widget):
-        z = self._z()
-        s = 10.0 / z
-        painter.setPen(QPen(ACCENT, 0, Qt.PenStyle.DashLine))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self.deg and self.mode == "image":
-            painter.save()
-            painter.translate(self.rect.center())
-            painter.rotate(self.deg)
-            painter.drawRect(QRectF(-self.rect.width() / 2, -self.rect.height() / 2,
-                                    self.rect.width(), self.rect.height()))
-            painter.restore()
-        else:
-            painter.drawRect(self.rect)
-        painter.setPen(QPen(ACCENT, 0))
-        for name, (hx, hy) in self.corner_points().items():
-            if name == "rot":
-                painter.setBrush(QBrush(ACCENT))
-                painter.drawEllipse(QPointF(hx, hy), s * 0.7, s * 0.7)
-                tx, ty = self._to_world(self.rect.center().x(), self.rect.top())
-                painter.drawLine(QPointF(tx, ty), QPointF(hx, hy))
-            else:
-                painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
-                painter.drawRect(QRectF(hx - s / 2, hy - s / 2, s, s))
-
-
-class BoxEditorItem(QGraphicsItem):
-    """文本框编辑覆盖层：实时渲染缓冲内容、光标、选区、输入法预编辑。"""
-
-    def __init__(self, canvas):
-        super().__init__()
-        self.canvas = canvas
-        self.setZValue(40)
-        self.setVisible(False)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._blink_on = True
-        self._font_cache = {}
-
-    # ------------------------------------------------ 绘制
-    def boundingRect(self):
-        sess = self.canvas.controller.session
-        if sess is None:
-            return QRectF()
-        bb = sess.buffer.bbox()
-        m = 12.0
-        return QRectF(bb[0] - m, bb[1] - m, (bb[2] - bb[0]) + 2 * m,
-                      (bb[3] - bb[1]) + 2 * m)
-
-    def _qfont(self, rf, st):
-        key = (getattr(rf, "key", ""), st.key)
-        if key not in self._font_cache:
-            from ui.overlay_fonts import qfont_for_style
-            self._font_cache[key] = qfont_for_style(rf, st)
-        return self._font_cache[key]
-
-    def paint(self, painter, option, widget):
-        c = self.canvas.controller
-        sess = c.session
-        if sess is None:
-            return
-        buf = sess.buffer
-        oracle = sess.oracle
-        adv = oracle.adv_fn()
-        lh = buf.line_height
-
-        # 框边界
-        bb = buf.bbox()
-        painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 160),
-                            0, Qt.PenStyle.DashLine))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRect(QRectF(bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1]))
-
-        # 选区
-        if sess.selection:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(QColor(30, 120, 215, 70)))
-            for (hi, s, e) in buf.selection_range(*sess.selection):
-                for v in buf.visual:
-                    if v.hard_idx != hi or v.end <= v.start:
-                        continue
-                    s2 = max(s, v.start)
-                    e2 = min(e, v.end)
-                    if e2 <= s2:
-                        continue
-                    hl = buf.hard_lines[hi]
-                    x0 = v.x + sum(adv(*hl[i]) for i in range(v.start, s2))
-                    x1 = v.x + sum(adv(*hl[i]) for i in range(v.start, e2))
-                    painter.drawRect(QRectF(x0, v.baseline - lh * 0.78,
-                                            max(x1 - x0, 1.0), lh))
-
-        # 文本（逐字符按 PDF 度量定位）
-        for v in buf.visual:
-            hl = buf.hard_lines[v.hard_idx]
-            cx = v.x
-            for i in range(v.start, v.end):
-                ch, st = hl[i]
-                rf = oracle.char_font(st, ch)
-                painter.setFont(self._qfont(rf, st))
-                painter.setPen(QColor(int(st.color[0] * 255),
-                                      int(st.color[1] * 255),
-                                      int(st.color[2] * 255)))
-                painter.drawText(QPointF(cx, v.baseline), ch)
-                cx += oracle.advance(st, ch)
-
-        # 光标（屏幕约 2px，避免缩放过细看不见）
-        if self._blink_on and sess.preedit == "":
-            x, bl = buf.cursor_pos(sess.cursor, adv)
-            cw = max(1.2, 2.0 / max(self.canvas.zoom, 0.05))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(ACCENT))
-            painter.drawRect(QRectF(x - cw / 2, bl - lh * 0.78, cw, lh))
-
-        # 输入法预编辑
-        if sess.preedit:
-            st = buf.style_at(sess.cursor)
-            rf = oracle.char_font(st, "预")
-            f = self._qfont(rf, st)
-            painter.setFont(f)
-            painter.setPen(QPen(QColor(ACCENT)))
-            x, bl = buf.cursor_pos(sess.cursor, adv)
-            painter.drawText(QPointF(x, bl), sess.preedit)
-            fm = painter.fontMetrics()
-            w = fm.horizontalAdvance(sess.preedit)
-            painter.setBrush(QBrush(QColor(ACCENT)))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(QRectF(x, bl + 1.5, w, 1.2))
-
-    def blink(self):
-        self._blink_on = not self._blink_on
-        if self.isVisible():
-            self.update()
+def local_pdf_paths(mime) -> list[str]:
+    """从拖放 MIME 取出本地 PDF 路径。"""
+    if mime is None or not mime.hasUrls():
+        return []
+    out = []
+    seen = set()
+    for url in mime.urls():
+        path = url.toLocalFile()
+        if not path:
+            continue
+        path = os.path.normpath(path)
+        if path.lower().endswith(".pdf") and os.path.isfile(path) and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
 
 
 class PageCanvas(QGraphicsView):
@@ -306,8 +64,12 @@ class PageCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.setInputMethodHints(Qt.InputMethodHint.ImhNone)
+        self.viewport().installEventFilter(self)
         # 事件全部由视图处理，避免 pixmap 吞掉 Windows 的 DblClick
         self.setInteractive(False)
         self.setMouseTracking(True)
@@ -315,6 +77,7 @@ class PageCanvas(QGraphicsView):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setBackgroundBrush(QBrush(QColor("#4B4F55")))
         self._scene.setBackgroundBrush(QBrush(QColor("#4B4F55")))
+        self.setAcceptDrops(True)
 
         self.pixmap_item = None
         self.box_editor = BoxEditorItem(self)
@@ -327,11 +90,21 @@ class PageCanvas(QGraphicsView):
         self.hint_item.setZValue(5)
         self.hint_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
+        self._empty_label = QLabel("点击此处打开 PDF\n或将文件拖到这里", self.viewport())
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._empty_label.setStyleSheet(
+            "QLabel { color: #D0D4DA; font-size: 16px; background: transparent; }"
+        )
+        self._empty_label.hide()
+
         # 交互状态
         self._selecting = False
         self._click_count = 0
         self._last_click_ms = 0.0
         self._drag = None  # {kind:"image"|"block", mode, start_rect, cur_rect, deg, corner, start_pos, block}
+        self._pan = None
+        self._last_page_turn = 0.0
 
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(530)
@@ -346,12 +119,30 @@ class PageCanvas(QGraphicsView):
         if pixmap is None:
             self.pixmap_item = None
             self._scene.setSceneRect(QRectF(0, 0, page_w, page_h))
+            self.set_empty_prompt(True)
             return
         self.pixmap_item = QGraphicsPixmapItem(pixmap)
         self.pixmap_item.setZValue(-10)
         self.pixmap_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._scene.addItem(self.pixmap_item)
         self._scene.setSceneRect(QRectF(0, 0, page_w, page_h))
+        self.set_empty_prompt(False)
+
+    def set_empty_prompt(self, on: bool):
+        self._empty_label.setVisible(bool(on))
+        self._layout_empty_prompt()
+
+    def empty_prompt_visible(self) -> bool:
+        return self._empty_label.isVisible()
+
+    def _layout_empty_prompt(self):
+        if not self._empty_label.isVisible():
+            return
+        self._empty_label.setGeometry(self.viewport().rect())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._layout_empty_prompt()
 
     def apply_zoom(self):
         self.resetTransform()
@@ -359,9 +150,31 @@ class PageCanvas(QGraphicsView):
         self.handle_layer.update()
         self.box_editor.update()
 
+    def center_page(self):
+        def _go():
+            r = self.sceneRect()
+            if r.width() <= 0 or r.height() <= 0:
+                return
+            self.centerOn(r.center())
+        QTimer.singleShot(0, _go)
+
+    def scroll_to_edge(self, edge):
+        def _go():
+            bar = self.verticalScrollBar()
+            if edge == "bottom":
+                bar.setValue(bar.maximum())
+            else:
+                bar.setValue(bar.minimum())
+        QTimer.singleShot(0, _go)
+
     def set_hint(self, text: str):
         self.hint_item.setPlainText(text)
         self.hint_item.setVisible(bool(text))
+
+    def hint_text(self) -> str:
+        if not self.hint_item.isVisible():
+            return ""
+        return self.hint_item.toPlainText()
 
     def session_active(self):
         return self.controller.session is not None
@@ -394,7 +207,63 @@ class PageCanvas(QGraphicsView):
         else:
             self.handle_layer.hide_layer()
 
+    def try_turn_page(self, delta: int, from_edge: str) -> bool:
+        """公开页边翻页。delta=+1 下一页，-1 上一页。"""
+        self._last_page_turn = 0.0
+        return bool(self._try_page_turn(delta, from_edge))
+
+    def begin_handle_drag(self, handle: str, scene_pos: QPointF) -> None:
+        self._start_drag(handle, scene_pos)
+
+    def update_handle_drag(self, scene_pos: QPointF) -> None:
+        self._update_drag(scene_pos)
+
+    def drag_rect(self):
+        d = self._drag
+        return None if not d else d.get("cur_rect")
+
+    def cancel_handle_drag(self) -> None:
+        self._drag = None
+        self._refresh_handles()
+
     # ------------------------------------------------ 输入法
+    def _grab_focus(self):
+        # 焦点必须留在视图上：绑到 viewport 时 Windows IME 收不到 inputMethodEvent
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def prepare_ime(self):
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self._grab_focus()
+        im = QGuiApplication.inputMethod()
+        if im is not None:
+            im.update(Qt.InputMethodQuery.ImQueryAll)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.viewport():
+            et = ev.type()
+            if et == QEvent.Type.InputMethod:
+                self.inputMethodEvent(ev)
+                return True
+            if et == QEvent.Type.InputMethodQuery:
+                queries = ev.queries()
+                for q in (
+                    Qt.InputMethodQuery.ImEnabled,
+                    Qt.InputMethodQuery.ImCursorRectangle,
+                    Qt.InputMethodQuery.ImFont,
+                    Qt.InputMethodQuery.ImCursorPosition,
+                    Qt.InputMethodQuery.ImAnchorPosition,
+                    Qt.InputMethodQuery.ImSurroundingText,
+                    Qt.InputMethodQuery.ImCurrentSelection,
+                    Qt.InputMethodQuery.ImHints,
+                ):
+                    if queries & q:
+                        ev.setValue(q, self.inputMethodQuery(q))
+                return True
+            if et == QEvent.Type.Resize:
+                self._layout_empty_prompt()
+        return super().eventFilter(obj, ev)
+
     def inputMethodEvent(self, e):
         c = self.controller
         if self.session_active():
@@ -408,25 +277,39 @@ class PageCanvas(QGraphicsView):
 
     def inputMethodQuery(self, q):
         if q == Qt.InputMethodQuery.ImEnabled:
-            return self.session_active()
+            return True
+        if q == Qt.InputMethodQuery.ImHints:
+            return Qt.InputMethodHint.ImhNone
+        if q == Qt.InputMethodQuery.ImFont:
+            return QFont("Microsoft YaHei", 12)
+        c = self.controller
         if q == Qt.InputMethodQuery.ImCursorRectangle:
-            c = self.controller
             if self.session_active():
                 x, bl = c.session_cursor_pos()
                 r = QRectF(x, bl - c.session.buffer.line_height, 2,
                            c.session.buffer.line_height)
                 return self.mapFromScene(r).boundingRect()
             return QRectF()
+        if q in (Qt.InputMethodQuery.ImCursorPosition,
+                 Qt.InputMethodQuery.ImAnchorPosition):
+            if self.session_active():
+                return int(c.session.cursor[1])
+            return 0
+        if q == Qt.InputMethodQuery.ImSurroundingText:
+            if self.session_active():
+                h, _o = c.session.cursor
+                line = c.session.buffer.hard_lines[h]
+                return "".join(ch for ch, _st in line)
+            return ""
+        if q == Qt.InputMethodQuery.ImCurrentSelection:
+            if self.session_active() and c.session.selection:
+                return c.session.buffer.selection_text(*c.session.selection)
+            return ""
         return super().inputMethodQuery(q)
 
-    # ------------------------------------------------ 鼠标
     def _pdf_pos(self, e):
         p = self.mapToScene(e.position().toPoint())
         return p.x(), p.y()
-
-    def _grab_focus(self):
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        self.viewport().setFocus(Qt.FocusReason.MouseFocusReason)
 
     def _try_begin_edit(self, x, y):
         """双击文本框进入编辑。成功返回 True。"""
@@ -438,7 +321,7 @@ class PageCanvas(QGraphicsView):
         if c.session is None:
             return False
         c.session_click(x, y)
-        self._grab_focus()
+        self.prepare_ime()
         self.box_editor._blink_on = True
         self.box_editor.update()
         return True
@@ -446,11 +329,13 @@ class PageCanvas(QGraphicsView):
     def mousePressEvent(self, e):
         self._grab_focus()
         if e.button() != Qt.MouseButton.LeftButton:
-            if e.button() == Qt.MouseButton.RightButton and self.controller.selected_image:
-                self._image_menu(e)
             super().mousePressEvent(e)
             return
-        import time
+        c = self.controller
+        if c.doc is None:
+            c.open_file()
+            e.accept()
+            return
         now = time.monotonic() * 1000
         self._click_count = (self._click_count + 1
                              if now - self._last_click_ms < 450 else 1)
@@ -458,7 +343,6 @@ class PageCanvas(QGraphicsView):
 
         sp = self.mapToScene(e.position().toPoint())
         x, y = sp.x(), sp.y()
-        c = self.controller
         shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
         # 会话内：定位缓冲光标 / 选词 / 选行
@@ -504,20 +388,41 @@ class PageCanvas(QGraphicsView):
             return
 
         c.deselect_all()
+        self._pan = {
+            "origin": e.position(),
+            "h": self.horizontalScrollBar().value(),
+            "v": self.verticalScrollBar().value(),
+        }
+        self.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
         e.accept()
 
-    def _image_menu(self, e):
+    def contextMenuEvent(self, e):
+        c = self.controller
         m = QMenu(self)
-        m.addAction("替换图片…", self.image_replace_requested.emit)
-        m.addAction("删除图片", self.controller.delete_selected_image)
-        m.addAction("取消选择", lambda: self.controller.deselect_all())
-        gp = e.globalPos()
-        m.exec(int(gp.x()), int(gp.y()))
+        if c.selected_image is not None:
+            m.addAction("替换图片…", self.image_replace_requested.emit)
+            m.addAction("删除图片", c.delete_selected_image)
+            m.addSeparator()
+        m.addAction(c.act_cut)
+        m.addAction(c.act_copy)
+        m.addAction(c.act_paste)
+        m.addAction(c.act_selall)
+        m.addSeparator()
+        m.addAction(c.act_bold)
+        m.addAction(c.act_italic)
+        m.exec(e.globalPos())
+        e.accept()
 
     def mouseMoveEvent(self, e):
         sp = self.mapToScene(e.position().toPoint())
         x, y = sp.x(), sp.y()
         self.hover_pos.emit(x, y)
+        if self._pan is not None:
+            delta = e.position() - self._pan["origin"]
+            self.horizontalScrollBar().setValue(int(self._pan["h"] - delta.x()))
+            self.verticalScrollBar().setValue(int(self._pan["v"] - delta.y()))
+            e.accept()
+            return
         if self._drag is not None:
             self._update_drag(sp)
             e.accept()
@@ -535,7 +440,7 @@ class PageCanvas(QGraphicsView):
             return
         hit = self.handle_layer.hit_handle(sp)
         if hit:
-            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+            self.viewport().setCursor(QCursor(HANDLE_CURSORS.get(
                 hit, Qt.CursorShape.ArrowCursor)))
             return
         x, y = sp.x(), sp.y()
@@ -544,10 +449,19 @@ class PageCanvas(QGraphicsView):
             self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
         elif c.image_at(x, y) is not None:
             self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        elif self.model is not None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        elif c.doc is None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         else:
             self.viewport().unsetCursor()
 
     def mouseReleaseEvent(self, e):
+        if self._pan is not None:
+            self._pan = None
+            self.viewport().unsetCursor()
+            e.accept()
+            return
         if self._drag is not None:
             self._finish_drag()
             e.accept()
@@ -576,19 +490,75 @@ class PageCanvas(QGraphicsView):
         e.accept()
 
     def wheelEvent(self, e):
-        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            d = e.angleDelta().y()
-            if d:
-                self.controller.set_zoom(self.zoom * (1.15 if d > 0 else 1 / 1.15))
+        mods = e.modifiers()
+        dx, dy = self._wheel_delta(e)
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if dy:
+                self.controller.set_zoom(self.zoom * (1.15 if dy > 0 else 1 / 1.15))
             e.accept()
-        else:
-            super().wheelEvent(e)
+            return
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            step = dx if abs(dx) >= abs(dy) else dy
+            if step:
+                bar = self.horizontalScrollBar()
+                bar.setValue(bar.value() - step)
+            e.accept()
+            return
+        if dy:
+            vbar = self.verticalScrollBar()
+            at_top = vbar.value() <= vbar.minimum()
+            at_bottom = vbar.value() >= vbar.maximum()
+            if dy > 0 and at_top and self._try_page_turn(-1, "bottom"):
+                e.accept()
+                return
+            if dy < 0 and at_bottom and self._try_page_turn(1, "top"):
+                e.accept()
+                return
+        super().wheelEvent(e)
+
+    def _wheel_delta(self, e):
+        pix = e.pixelDelta()
+        if not pix.isNull():
+            return pix.x(), pix.y()
+        ang = e.angleDelta()
+        return ang.x(), ang.y()
+
+    def _try_page_turn(self, delta, edge):
+        c = self.controller
+        if c.doc is None:
+            return False
+        nxt = c.page_no + delta
+        if nxt < 0 or nxt >= c.doc.page_count:
+            return False
+        now = time.monotonic()
+        if now - self._last_page_turn < 0.28:
+            return True
+        self._last_page_turn = now
+        c.set_page(nxt, edge=edge)
+        return True
 
     def focusInEvent(self, e):
         super().focusInEvent(e)
         if self.session_active():
             self.box_editor._blink_on = True
             self.box_editor.update()
+
+    def dragEnterEvent(self, e):
+        if local_pdf_paths(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        self.dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        paths = local_pdf_paths(e.mimeData())
+        if not paths:
+            e.ignore()
+            return
+        self.controller.open_file(paths[0])
+        e.acceptProposedAction()
 
     # ------------------------------------------------ 拖拽（图片 / 文本框）
     def _start_drag(self, hit, sp):
@@ -600,7 +570,7 @@ class PageCanvas(QGraphicsView):
             self._drag = {"kind": "image", "mode": hit, "start_rect": QRectF(r),
                           "cur_rect": QRectF(r), "deg": img.deg, "corner": hit,
                           "start_pos": QPointF(sp), "img": img}
-            self.viewport().setCursor(QCursor(_HANDLE_CURSORS.get(
+            self.viewport().setCursor(QCursor(HANDLE_CURSORS.get(
                 hit, Qt.CursorShape.SizeAllCursor)))
         elif blk is not None and self.handle_layer.mode == "box":
             r = to_qrect(blk.bbox)
@@ -691,7 +661,6 @@ class PageCanvas(QGraphicsView):
         c = self.controller
         mods = e.modifiers()
         ctrl = mods & Qt.KeyboardModifier.ControlModifier
-        shift = mods & Qt.KeyboardModifier.ShiftModifier
         key = e.key()
 
         # 选中图片：Delete 删除

@@ -6,10 +6,7 @@
 """
 import io
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .compat import fitz
 
 import numpy as np
 
@@ -92,8 +89,10 @@ def verify(saved_path: str, originals: dict, edit_regions: dict,
             h, w = changed.shape
             mask = np.zeros((h, w), dtype=bool)
             for r in (edit_regions or {}).get(i, []):
-                x0 = max(0, int(r[0] * zoom)); y0 = max(0, int(r[1] * zoom))
-                x1 = min(w, int(np.ceil(r[2] * zoom))); y1 = min(h, int(np.ceil(r[3] * zoom)))
+                x0 = max(0, int(r[0] * zoom))
+                y0 = max(0, int(r[1] * zoom))
+                x1 = min(w, int(np.ceil(r[2] * zoom)))
+                y1 = min(h, int(np.ceil(r[3] * zoom)))
                 if x1 > x0 and y1 > y0:
                     mask[y0:y1, x0:x1] = True
             total = changed.size

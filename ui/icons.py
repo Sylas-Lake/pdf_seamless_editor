@@ -164,6 +164,18 @@ def _draw(p: QPainter, kind: str, r: QRectF, col: QColor):
         p.setBrush(col)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(QRectF(x + 1.0, y + 1.0, w * 0.38 - 1.5, h - 2.0))
+    elif kind == "bold":
+        f = p.font()
+        f.setPixelSize(max(10, int(h * 0.88)))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), "B")
+    elif kind == "italic":
+        f = p.font()
+        f.setPixelSize(max(10, int(h * 0.88)))
+        f.setItalic(True)
+        p.setFont(f)
+        p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), "I")
     elif kind == "help":
         p.drawEllipse(r)
         f = p.font()

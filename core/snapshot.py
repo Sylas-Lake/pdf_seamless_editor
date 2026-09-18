@@ -10,10 +10,7 @@
 """
 import re
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .types import PageState
 
 _RES_RE = re.compile(r"/Resources\s+(\d+)\s+0\s+R")
 
@@ -29,7 +26,7 @@ def _xref_source(doc, xref) -> str:
             return doc.xref_object(xref)
 
 
-def capture_page_state(doc, page) -> dict:
+def capture_page_state(doc, page) -> PageState:
     """捕获页面当前完整状态。"""
     page_xref = page.xref
     page_obj = _xref_source(doc, page_xref)
@@ -63,7 +60,7 @@ def capture_page_state(doc, page) -> dict:
     }
 
 
-def restore_page_state(doc, page, state: dict, page_index: int = None):
+def restore_page_state(doc, page, state: PageState | None, page_index: int | None = None) -> None:
     """把页面恢复到快照状态（字节级）。"""
     if not state:
         return
@@ -97,7 +94,7 @@ def restore_page_state(doc, page, state: dict, page_index: int = None):
         pass
 
 
-def page_state_equal(doc, page, state: dict) -> bool:
+def page_state_equal(doc, page, state: PageState | None) -> bool:
     """当前页面状态与快照是否一致（字节级比较，调试/自测用）。"""
     if not state:
         return True

@@ -2,14 +2,15 @@
 
 - remove_text_region：Redaction 真删除（fill=False 不遮盖底图）；
 - insert_runs：按可视行 Run 原位插入（提交时一次完成）；
+- apply_box_rebuild：恢复快照后 redact + 插入（预览与提交共用）；
 - place_image：图片移动/缩放/旋转（keep_proportion=False 保证所见即所得）。
 """
 import io
+from collections.abc import Iterable, Sequence
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .compat import fitz
+from .fonts import insert_emphasis
+from .types import PdfRect
 
 try:
     from PIL import Image
@@ -33,10 +34,13 @@ def _redact_params(page):
         return False, False
 
 
-def apply_redact(page, rects, *, images, graphics=ART_NONE, text=None):
+def apply_redact(page, rects: Iterable[PdfRect], *, images, graphics=ART_NONE, text=None):
     """添加并应用一批 redaction（真正的删除，不绘制遮盖）。"""
     for r in rects:
-        page.add_redact_annot(fitz.Rect(r))
+        try:
+            page.add_redact_annot(fitz.Rect(r), fill=False, cross_out=False)
+        except TypeError:
+            page.add_redact_annot(fitz.Rect(r))
     has_g, has_t = _redact_params(page)
     kwargs = {"images": images}
     if has_g:
@@ -46,22 +50,55 @@ def apply_redact(page, rects, *, images, graphics=ART_NONE, text=None):
     page.apply_redactions(**kwargs)
 
 
+def _as_rects(rect) -> list:
+    """单个 PdfRect 或一组 PdfRect。"""
+    if rect is None:
+        return []
+    if isinstance(rect, (list, tuple)) and rect and isinstance(rect[0], (int, float)):
+        return [tuple(rect)]
+    return [tuple(r) for r in rect]
+
+
 def remove_text_region(page, rect):
-    """清除一个文本区域的全部文字（保留图片与矢量图形）。"""
-    apply_redact(page, [rect], images=IMG_NONE, graphics=ART_NONE)
+    """清除一个或一批文本区域的全部文字（保留图片与矢量图形）。"""
+    apply_redact(page, _as_rects(rect), images=IMG_NONE, graphics=ART_NONE)
 
 
-def insert_runs(page, runs, resolver):
+def insert_runs(page, runs: Sequence, resolver):
     """按提交序列插入文本：[(text, style, x, baseline, rf), ...]"""
     for text, style, x, baseline, rf in runs:
         if not text:
             continue
-        key = resolver.ensure_page_font(page, rf)
-        page.insert_text(fitz.Point(x, baseline), text, fontname=key,
-                         fontsize=style.size, color=style.color)
+        key = resolver.insert_fontname(page, rf, text, style)
+        kwargs = {
+            "fontname": key,
+            "fontsize": style.size,
+            "color": style.color,
+        }
+        rm, bw, shear = insert_emphasis(style, rf, key)
+        if rm:
+            kwargs["render_mode"] = rm
+            kwargs["border_width"] = bw
+        if shear:
+            kwargs["morph"] = (fitz.Point(x, baseline),
+                               fitz.Matrix(1, 0, shear, 1, 0, 0))
+        page.insert_text(fitz.Point(x, baseline), text, **kwargs)
 
 
-def image_blob(doc, xref: int):
+def apply_box_rebuild(doc, page_index: int, before_state, rect,
+                      runs: Sequence, resolver):
+    """预览 = 提交：恢复原页 → redact 原字形区域 → insert_runs。返回当前页对象。"""
+    from .snapshot import restore_page_state
+    page = doc[page_index]
+    restore_page_state(doc, page, before_state)
+    page = doc[page_index]
+    resolver.invalidate_page(page_index)
+    remove_text_region(page, rect)
+    insert_runs(page, runs, resolver)
+    return doc[page_index]
+
+
+def image_blob(doc, xref: int) -> bytes | None:
     """提取图片原始字节。"""
     info = doc.extract_image(xref)
     if isinstance(info, dict):
@@ -71,7 +108,8 @@ def image_blob(doc, xref: int):
     return None
 
 
-def place_image(doc, page, remove_rects, new_rect, deg: float, blob: bytes):
+def place_image(doc, page, remove_rects: Sequence[PdfRect] | None,
+                new_rect: PdfRect | None, deg: float, blob: bytes):
     """图片移动/缩放/旋转：移除原实例（仅图片），于新位置精确重插。
     keep_proportion=False → 手柄所见即所得。"""
     if remove_rects:

@@ -2,10 +2,7 @@
 import io
 import os
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .compat import fitz
 
 try:
     from PIL import Image, ImageDraw
