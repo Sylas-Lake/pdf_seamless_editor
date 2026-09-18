@@ -548,7 +548,7 @@ class BoxBuffer:
                     cj, sj = hl[j]
                     rfj = oracle.char_font(sj, cj)
                     pj = pos[j] if j < len(pos) else (cx, bl)
-                    if (rfj is rf and sj.key == st.key
+                    if (rfj.key == rf.key and sj.key == st.key
                             and abs(pj[0] - cx) < 0.05 and abs(pj[1] - bl) < 0.05):
                         text += cj
                         cx += oracle.advance(sj, cj)

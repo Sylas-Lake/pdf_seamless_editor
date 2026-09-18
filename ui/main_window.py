@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout,
 from core.compat import fitz
 from core import executor, verifier
 from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
-from core.extractor import extract_page
+from core.extractor import extract_page, line_redact_rects
 from core.fidelity import PageFidelity, worse
 from core.fonts import FontOracle, FontResolver
 from core.snapshot import (capture_page_state, restore_page_state)
@@ -417,7 +417,7 @@ class MainWindow(QMainWindow):
         page = self.current_page()
         before = capture_page_state(self.doc, page)
         buffer = BoxBuffer(block)
-        oracle = FontOracle(self.resolver, page)
+        oracle = FontOracle.from_block(self.resolver, page, block)
         buffer.set_measure(oracle.adv_fn())
         sess = EditSession(block, self.page_no, buffer, before, oracle)
         self.session = sess
@@ -453,7 +453,7 @@ class MainWindow(QMainWindow):
         runs = sess.buffer.commit_runs(sess.oracle)
         page = executor.apply_box_rebuild(
             self.doc, page_index, sess.before_state,
-            _expand(sess.block.bbox, 0.6), runs, self.resolver)
+            line_redact_rects(sess.block), runs, self.resolver)
         sess.oracle.page = page
         sess.previewed = True
         self._refresh_render_only()
@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
         if not sess.previewed:
             executor.apply_box_rebuild(
                 self.doc, sess.page_index, sess.before_state,
-                _expand(sess.block.bbox, 0.6), runs, self.resolver)
+                line_redact_rects(sess.block), runs, self.resolver)
         page = self.doc[sess.page_index]
         after = capture_page_state(self.doc, page)
         cmd = PageStateCommand("编辑文本框", self.page_no,
@@ -767,14 +767,14 @@ class MainWindow(QMainWindow):
         page = self.current_page()
         before = capture_page_state(self.doc, page)
         buffer = BoxBuffer(block)
-        oracle = FontOracle(self.resolver, page)
+        oracle = FontOracle.from_block(self.resolver, page, block)
         buffer.set_measure(oracle.adv_fn())
         if abs(dx) > 0.5 or abs(dy) > 0.5:
             buffer.translate(dx, dy)
         if abs(dw) > 0.5:
             # dw 相对 PDF 框宽，不能加在 auto_width 后的内容宽度上
             buffer.set_width((block.bbox[2] - block.bbox[0]) + dw)
-        executor.remove_text_region(page, _expand(block.bbox, 0.6))
+        executor.remove_text_region(page, line_redact_rects(block))
         runs = buffer.commit_runs(oracle)
         executor.insert_runs(page, runs, self.resolver)
         after = capture_page_state(self.doc, page)
@@ -788,7 +788,7 @@ class MainWindow(QMainWindow):
         block = self.selected_block
         page = self.current_page()
         before = capture_page_state(self.doc, page)
-        executor.remove_text_region(page, _expand(block.bbox, 0.6))
+        executor.remove_text_region(page, line_redact_rects(block))
         after = capture_page_state(self.doc, page)
         cmd = PageStateCommand("删除文本框内容", self.page_no, before, after)
         cmd.edit_rects = [_expand(block.bbox, 1.0)]

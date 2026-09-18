@@ -64,12 +64,13 @@ def fonts_same_face(a: str, b: str) -> bool:
     return bool(ka) and ka == kb
 
 
-def _face_style(name: str, flags: int = 0) -> tuple[bool, bool]:
+def _face_style(name: str, flags: int = 0) -> tuple[bool, bool, bool]:
     n = (name or "").lower()
     bold = bool(flags & 16) or any(
         w in n for w in ("bold", "black", "heavy", "semibold", "demibold"))
     italic = bool(flags & 2) or ("italic" in n) or ("oblique" in n)
-    return bold, italic
+    light = ("light" in n) and ("ultralight" in n or "light" in n) and "bold" not in n
+    return bold, italic, light
 
 
 def _has_glyph(font, ch: str) -> bool:
@@ -108,8 +109,19 @@ _ALIAS = {
     "simhei": "simhei.ttf", "黑体": "simhei.ttf", "kaiti": "simkai.ttf",
     "楷体": "simkai.ttf", "simkai": "simkai.ttf", "fangsong": "simfang.ttf",
     "仿宋": "simfang.ttf", "simfang": "simfang.ttf", "dengxian": "deng.ttf",
-    "等线": "deng.ttf", "deng": "deng.ttf", "微软雅黑 light": "msyhlight.ttc",
+    "等线": "deng.ttf", "deng": "deng.ttf", "微软雅黑 light": "msyhl.ttc",
     "arial": "arial.ttf", "calibri": "calibri.ttf", "times new roman": "times.ttf",
+}
+
+# ident → (regular, bold, italic, bolditalic, light)
+_FACE_FILES = {
+    "arial": ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf", None),
+    "timesnewroman": ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf", None),
+    "calibri": ("calibri.ttf", "calibrib.ttf", "calibrii.ttf", "calibriz.ttf", None),
+    "microsoftyahei": ("msyh.ttc", "msyhbd.ttc", None, None, "msyhl.ttc"),
+    "simsun": ("simsun.ttc", None, None, None, None),
+    "nsimsun": ("simsun.ttc", None, None, None, None),
+    "simhei": ("simhei.ttf", None, None, None, None),
 }
 
 
@@ -145,7 +157,8 @@ def _registry_fonts() -> dict:
     return _REG_FONTS
 
 
-def system_font_candidates(family: str) -> list:
+def system_font_candidates(family: str, *, bold: bool = False,
+                           italic: bool = False, light: bool = False) -> list:
     """按族名查找系统字体文件候选（策略 A'：扩展原字体）。"""
     fam = (family or "").strip()
     if not fam:
@@ -158,6 +171,24 @@ def system_font_candidates(family: str) -> list:
     def _add(path):
         if path and os.path.isfile(path) and path not in out:
             out.append(path)
+
+    def _add_name(fn):
+        if fn:
+            _add(os.path.join(d, fn))
+
+    # 0) 按字重优先（Arial-BoldMT 不应先拿到 arial.ttf）
+    faces = _FACE_FILES.get(ident)
+    if faces:
+        regular, fbold, fitalic, fbi, flight = faces
+        if light and flight:
+            _add_name(flight)
+        if bold and italic and fbi:
+            _add_name(fbi)
+        if bold and fbold:
+            _add_name(fbold)
+        if italic and fitalic:
+            _add_name(fitalic)
+        _add_name(regular)
 
     # 1) 别名：原文、小写、归一身份（ArialMT / MicrosoftYaHei）
     if fam_l in _ALIAS:
@@ -300,7 +331,7 @@ class FontResolver:
             fonts = page.get_fonts(full=True)
         except Exception:
             return []
-        wb, wi = _face_style(style.font_name or "", getattr(style, "flags", 0) or 0)
+        wb, wi, _wl = _face_style(style.font_name or "", getattr(style, "flags", 0) or 0)
         scored = []
         for finfo in fonts:
             basefont = finfo[3] if len(finfo) > 3 else ""
@@ -316,7 +347,7 @@ class FontResolver:
                 exact or fonts_same_face(basefont, style.font_name))
             if not (exact or ident or builtin):
                 continue
-            fb, fi = _face_style(basefont, 0)
+            fb, fi, _fl = _face_style(basefont, 0)
             scored.append(((fb == wb) + (fi == wi), finfo))
         scored.sort(key=lambda x: -x[0])
         return [f for _, f in scored]
@@ -329,18 +360,29 @@ class FontResolver:
         for finfo in self._page_font_hits(page, style):
             resname = finfo[4] if len(finfo) > 4 else ""
             buf, f = self._extracted(finfo[0])
-            if buf and f is not None and covers(f, text):
-                key = self._register_buffer(buf)
-                return ResolvedFont(key, f, True, "复用原始嵌入字体")
+            if buf:
+                if f is not None and covers(f, text):
+                    key = self._register_buffer(buf)
+                    return ResolvedFont(key, f, True, "复用原始嵌入字体")
+                if not text:
+                    # 身份解析：CID 子集可能没有 Unicode cmap，covers 会假阴性
+                    key = self._register_buffer(buf)
+                    return ResolvedFont(key, f, True, "复用原始嵌入字体",
+                                        coverage_ok=f is not None)
             if resname in BUILTIN_KEYS:
                 bf = self._load_buffer(None, resname)
                 if bf is not None and covers(bf, text):
                     return ResolvedFont(resname, bf, True,
                                         "复用原内置字体资源")
+                if not text and bf is not None:
+                    return ResolvedFont(resname, bf, True,
+                                        "复用原内置字体资源")
 
         # 策略 A'：系统同名完整字体（扩展原字体）
         if base:
-            for path in system_font_candidates(base):
+            wb, wi, wl = _face_style(style.font_name or "",
+                                     getattr(style, "flags", 0) or 0)
+            for path in system_font_candidates(base, bold=wb, italic=wi, light=wl):
                 f = self._load_file(path)
                 if f is not None and covers(f, text):
                     key = self._register_file(path)
@@ -391,19 +433,35 @@ class FontResolver:
 
 # ---------------------------------------------------------------- 字体决策器
 
+def original_chars_from_block(block) -> set:
+    """框内已出现的 (style.key, char)，重建时这些字不再做 Unicode cmap 检查。"""
+    out = set()
+    for ln in getattr(block, "lines", []) or []:
+        for g in getattr(ln, "glyphs", []) or []:
+            if g.style is not None and g.char:
+                out.add((g.style.key, g.char))
+    return out
+
+
 class FontOracle:
     """缓冲区编辑的字体决策器：为每个 (样式, 字符) 决定插入字体与 advance。
 
     规则：优先复用该样式的原始字体（子集覆盖检查）；
     新增字符若不在子集内，回退到替代字体——保证布局度量与提交渲染一致。
+    原框里已经画过的字：跳过 has_glyph(unicode)（CID 子集常无 Unicode cmap）。
     """
 
-    def __init__(self, resolver, page):
+    def __init__(self, resolver, page, original_chars=None):
         self.resolver = resolver
         self.page = page
         self._style_font = {}    # style.key -> ResolvedFont（原始字体）
         self._char_cache = {}    # (style_key, ch) -> (rf, adv)
         self._adv_cache = {}     # (rf_key, ch, size) -> float
+        self._orig_chars = original_chars or set()
+
+    @classmethod
+    def from_block(cls, resolver, page, block):
+        return cls(resolver, page, original_chars_from_block(block))
 
     def original_font(self, style) -> ResolvedFont:
         """该样式在页面上的原始字体。
@@ -426,6 +484,11 @@ class FontOracle:
             return self._char_cache[k][0]
         rf = self.original_font(style)
         from .fonts import covers
+        painted = (style.key, ch) in self._orig_chars
+        if rf is not None and painted:
+            # 这个字本来就用该样式画在页面上：相信原字体，不查 Unicode cmap
+            self._char_cache[k] = (rf, None)
+            return rf
         if rf is None or rf.font is None or not covers(rf.font, ch):
             rf = self.resolver.resolve(self.page, style, ch)
         self._char_cache[k] = (rf, None)
