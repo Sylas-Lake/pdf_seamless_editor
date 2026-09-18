@@ -407,6 +407,9 @@ class PageCanvas(QGraphicsView):
         m.addAction(c.act_copy)
         m.addAction(c.act_paste)
         m.addAction(c.act_selall)
+        m.addSeparator()
+        m.addAction(c.act_bold)
+        m.addAction(c.act_italic)
         m.exec(e.globalPos())
         e.accept()
 

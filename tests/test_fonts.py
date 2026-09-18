@@ -4,6 +4,7 @@ import os
 import tempfile
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from core.compat import fitz
@@ -344,3 +345,73 @@ def test_faux_italic_insert_writes_text():
     stream = b"".join(doc.xref_stream(x) for x in page.get_contents())
     assert b"cm" in stream
     doc.close()
+
+
+def test_bold_fallback_from_named_bold_writes_tr():
+    """原字体名带 Bold、实际插入落到常规替代时，必须假粗，不能打回原形。"""
+    from core.models import TextStyle
+    from core.fonts import ResolvedFont
+    doc = fitz.open()
+    page = doc.new_page()
+    st = TextStyle(font_name="Arial-BoldMT", size=16, flags=16)
+    rf = ResolvedFont("china-s", fitz.Font("china-s"), False, "内置替代字体 china-s")
+    executor.insert_runs(page, [("粗体字", st, 72, 120, rf)], FontResolver(doc))
+    stream = b"".join(doc.xref_stream(x) for x in page.get_contents())
+    assert b"Tr" in stream
+    doc.close()
+
+
+def test_italic_fallback_from_named_italic_writes_cm():
+    """原字体名带 Italic、插入落到 helv 时仍要剪切，不能变回正体。"""
+    from core.models import TextStyle
+    from core.fonts import ResolvedFont
+    doc = fitz.open()
+    page = doc.new_page()
+    st = TextStyle(font_name="Arial-ItalicMT", size=16, flags=2)
+    rf = ResolvedFont("helv", fitz.Font("helv"), False, "内置替代字体 helv")
+    executor.insert_runs(page, [("Slanted", st, 72, 140, rf)], FontResolver(doc))
+    stream = b"".join(doc.xref_stream(x) for x in page.get_contents())
+    assert b"cm" in stream
+    doc.close()
+
+
+def test_edit_keeps_arial_bold():
+    arialbd = r"C:\Windows\Fonts\arialbd.ttf"
+    if not os.path.isfile(arialbd):
+        pytest.skip("no Arial Bold")
+    from core.textbox import BoxBuffer
+    from core.snapshot import capture_page_state
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_font(fontname="FB", fontfile=arialbd)
+    page.insert_text((72, 120), "BoldTitle", fontname="FB", fontsize=16)
+    model = extract_page(page, 0)
+    blk = next(b for b in model.blocks if "BoldTitle" in b.text())
+    assert blk.dominant_style().is_bold
+    resolver = FontResolver(doc)
+    oracle = FontOracle.from_block(resolver, page, blk)
+    buf = BoxBuffer(blk)
+    buf.set_measure(oracle.adv_fn())
+    buf.insert((0, len(buf.hard_lines[0])), "X")
+    runs = buf.commit_runs(oracle)
+    before = capture_page_state(doc, page)
+    page1 = executor.apply_box_rebuild(
+        doc, 0, before, line_redact_rects(blk), runs, resolver)
+    model2 = extract_page(page1, 0)
+    st2 = next(b for b in model2.blocks if "BoldTitle" in b.text()).dominant_style()
+    assert st2.is_bold, (st2.font_name, st2.flags, st2.render_mode)
+    doc.close()
+
+
+def test_set_style_bold_off_strips_name():
+    from core.fonts import set_style_bold, set_style_italic, strip_face_tokens
+    from core.models import TextStyle
+    st = TextStyle(font_name="Arial-BoldMT", flags=16, display_name="Arial · 粗体")
+    off = set_style_bold(st, False)
+    assert not off.is_bold
+    assert "bold" not in off.font_name.lower()
+    on = set_style_bold(TextStyle(font_name="SimSun"), True)
+    assert on.is_bold and on.render_mode == 2
+    it = set_style_italic(TextStyle(font_name="Arial"), True)
+    assert it.is_italic
+    assert strip_face_tokens("Arial-ItalicMT", italic=True).lower().startswith("arial")

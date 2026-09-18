@@ -64,6 +64,7 @@ def test_gui_smoke(window):
     check("图标栏无生成示例", "生成示例" not in bar_names)
     check("图标栏无剪切复制粘贴全选",
           not any(t in bar_names for t in ("剪切", "复制", "粘贴", "全选")))
+    check("图标栏有粗体斜体", "粗体" in bar_names and "斜体" in bar_names)
     check("剪贴板快捷键仍在",
           "Ctrl+X" in win.act_cut.shortcut().toString().replace(" ", ""))
 
@@ -265,6 +266,12 @@ def test_gui_smoke(window):
         st = win.current_style()
         check("会话应用字号", st is not None and abs(st.size - 20.0) < 0.05)
         check("应用样式后缓冲已改", win.session.buffer.changed)
+        win.apply_emphasis(bold=True)
+        st = win.current_style()
+        check("会话可加粗", st is not None and st.is_bold)
+        win.apply_emphasis(italic=True)
+        st = win.current_style()
+        check("会话可倾斜", st is not None and st.is_italic)
         win.cancel_session()
         check("样式取消恢复", win.session is None)
 

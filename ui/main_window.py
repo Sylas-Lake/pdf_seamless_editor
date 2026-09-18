@@ -97,6 +97,14 @@ class MainWindow(QMainWindow):
         self.act_paste = _act("粘贴", "Ctrl+V", self.paste, "paste")
         self.act_selall = _act("全选", "Ctrl+A", self.session_select_all, "select_all",
                               "全选（框内，Ctrl+A）")
+        self.act_bold = _act("粗体", "Ctrl+B",
+                             lambda: self.apply_emphasis(bold=self.act_bold.isChecked()),
+                             "bold", "粗体（Ctrl+B）")
+        self.act_bold.setCheckable(True)
+        self.act_italic = _act("斜体", "Ctrl+I",
+                               lambda: self.apply_emphasis(italic=self.act_italic.isChecked()),
+                               "italic", "斜体（Ctrl+I）")
+        self.act_italic.setCheckable(True)
         self.act_zoom_out = _act("缩小", "Ctrl+-", lambda: self.set_zoom(self.zoom / 1.15),
                                 "zoom_out")
         self.act_zoom_in = _act("放大", "Ctrl+=", lambda: self.set_zoom(self.zoom * 1.15),
@@ -199,6 +207,9 @@ class MainWindow(QMainWindow):
         self.chrome.add_sep()
         self.chrome.add_item(_btn(self.act_undo))
         self.chrome.add_item(_btn(self.act_redo))
+        self.chrome.add_sep()
+        self.chrome.add_item(_btn(self.act_bold))
+        self.chrome.add_item(_btn(self.act_italic))
         self.chrome.add_sep()
         self.chrome.add_item(_btn(self.act_zoom_out))
         self.lb_zoom = _label("100%", 44)
@@ -829,6 +840,58 @@ class MainWindow(QMainWindow):
         cmd.edit_rects = line_redact_rects(block) + [buffer.bbox()]
         self._register_cmd(cmd, buffer, runs)
 
+    def apply_emphasis(self, *, bold=None, italic=None):
+        """粗体/斜体开关：会话内改缓冲，否则整框重建。"""
+        if bold is None and italic is None:
+            return
+        if not self._editable():
+            self._sync_emphasis_actions()
+            return
+        if self.session is not None:
+            self.session.buffer.apply_style(
+                bold=bold, italic=italic, selection=self.session.selection)
+            self._sync_session_preview()
+            self.status_hint("已应用字形")
+            self._sync_emphasis_actions()
+            return
+        block = self.selected_block
+        if block is None:
+            self.status_hint("请先选中文本框或进入编辑")
+            self._sync_emphasis_actions()
+            return
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        buffer = BoxBuffer(block)
+        oracle = FontOracle.from_block(self.resolver, page, block)
+        buffer.overflow = self._overflow_strategy
+        buffer.set_measure(oracle.adv_fn())
+        buffer.apply_style(bold=bold, italic=italic, selection=None)
+        executor.remove_text_region(page, line_redact_rects(block))
+        runs = buffer.commit_runs(oracle)
+        executor.insert_runs(page, runs, self.resolver)
+        after = capture_page_state(self.doc, page)
+        if bold is True:
+            title = "粗体"
+        elif bold is False:
+            title = "取消粗体"
+        elif italic is True:
+            title = "斜体"
+        else:
+            title = "取消斜体"
+        cmd = PageStateCommand(title, self.page_no, before, after)
+        cmd.edit_rects = line_redact_rects(block) + [buffer.bbox()]
+        self._register_cmd(cmd, buffer, runs)
+        self._sync_emphasis_actions()
+
+    def _sync_emphasis_actions(self):
+        st = self.current_style()
+        for act, on in (
+                (self.act_bold, bool(st is not None and st.is_bold)),
+                (self.act_italic, bool(st is not None and st.is_italic))):
+            act.blockSignals(True)
+            act.setChecked(on)
+            act.blockSignals(False)
+
     def status_hint(self, msg):
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.set_hint(msg or "")
@@ -1131,6 +1194,7 @@ class MainWindow(QMainWindow):
 
     def _update_panels(self):
         self.panel.update_style(self.current_style())
+        self._sync_emphasis_actions()
         sess = self.session
         if sess is not None:
             n = sess.buffer.char_count()

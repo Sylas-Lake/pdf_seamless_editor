@@ -101,9 +101,9 @@ def fonts_same_face(a: str, b: str) -> bool:
 
 def _face_style(name: str, flags: int = 0) -> tuple[bool, bool, bool]:
     n = (name or "").lower()
-    bold = bool(flags & 16) or any(
+    bold = bool(flags & 16) or "粗体" in (name or "") or any(
         w in n for w in ("bold", "black", "heavy", "semibold", "demibold"))
-    italic = bool(flags & 2) or ("italic" in n) or ("oblique" in n)
+    italic = bool(flags & 2) or "斜体" in (name or "") or ("italic" in n) or ("oblique" in n)
     light = ("light" in n) and ("ultralight" in n or "light" in n) and "bold" not in n
     return bold, italic, light
 
@@ -311,6 +311,118 @@ def font_can_insert(rf, text: str) -> bool:
     if font is None:
         return False
     return covers(font, text)
+
+
+def _rf_name_blob(rf) -> str:
+    if rf is None:
+        return ""
+    f = getattr(rf, "font", None)
+    return " ".join([
+        getattr(rf, "key", "") or "",
+        getattr(rf, "source", "") or "",
+        getattr(f, "name", "") or "" if f is not None else "",
+    ])
+
+
+def resolved_is_bold(rf) -> bool:
+    """即将插入的字体本身是不是粗体（内置 CJK/Base14 都算常规）。"""
+    if rf is None:
+        return False
+    key = getattr(rf, "key", "") or ""
+    if key in BUILTIN_KEYS:
+        return False
+    f = getattr(rf, "font", None)
+    if f is not None:
+        if getattr(f, "is_bold", False):
+            return True
+        flags = getattr(f, "flags", None)
+        if isinstance(flags, dict) and (flags.get("bold") or flags.get("fake-bold")):
+            return True
+    return _face_style(_rf_name_blob(rf), 0)[0]
+
+
+def resolved_is_italic(rf) -> bool:
+    if rf is None:
+        return False
+    key = getattr(rf, "key", "") or ""
+    if key in BUILTIN_KEYS:
+        return False
+    f = getattr(rf, "font", None)
+    if f is not None:
+        if getattr(f, "is_italic", False):
+            return True
+        flags = getattr(f, "flags", None)
+        if isinstance(flags, dict) and (flags.get("italic") or flags.get("fake-italic")):
+            return True
+    return _face_style(_rf_name_blob(rf), 0)[1]
+
+
+def insert_emphasis(style, rf, fontname: str = "") -> tuple[int, float, float]:
+    """插入时的字形：原字体是粗/斜 → 原样；落到常规替代 → 假粗（Tr=2）/假斜（剪切）。
+
+    返回 (render_mode, border_width, italic_shear)。
+    """
+    key = fontname or getattr(rf, "key", "") or ""
+    builtin = key in BUILTIN_KEYS
+    have_b = (not builtin) and resolved_is_bold(rf)
+    have_i = (not builtin) and resolved_is_italic(rf)
+    want_b = bool(getattr(style, "is_bold", False))
+    want_i = bool(getattr(style, "is_italic", False))
+    size = float(getattr(style, "size", 11.0) or 11.0)
+    bw = float(getattr(style, "border_width", 0.05) or 0.05)
+    rm = 0
+    if want_b and not have_b:
+        rm = 2
+        bw = max(bw, 0.15, size * 0.035)
+    shear = 0.22 if (want_i and not have_i) else 0.0
+    return rm, bw, shear
+
+
+def strip_face_tokens(name: str, *, bold: bool = False, italic: bool = False) -> str:
+    """从字体名去掉粗/斜标记，便于手动取消字形后改走常规面。"""
+    s = strip_subset_prefix(name or "")
+    if not s:
+        return ""
+    if bold:
+        s = re.sub(r"(?i)[\s,\-_]*(?:bolditalic|boldoblique)(?:mt)?", "", s)
+        s = re.sub(r"(?i)[\s,\-_]*(?:semi)?bold(?:mt)?", "", s)
+        s = re.sub(r"(?i)[\s,\-_]*(?:black|heavy)(?:mt)?", "", s)
+        s = re.sub(r"粗体", "", s)
+        s = re.sub(r"(?i)-bd\b", "", s)
+    if italic:
+        s = re.sub(r"(?i)[\s,\-_]*(?:bolditalic|boldoblique)(?:mt)?", "", s)
+        s = re.sub(r"(?i)[\s,\-_]*(?:italic|oblique)(?:mt)?", "", s)
+        s = re.sub(r"斜体", "", s)
+    s = re.sub(r"[\s,\-_]+", " ", s).strip(" ,-_")
+    return s or strip_subset_prefix(name or "")
+
+
+def set_style_bold(style, on: bool):
+    """打开/关闭粗体（flags + 必要时假粗；关闭时去掉名里的 Bold）。"""
+    st = style.copy()
+    if on:
+        st.flags |= 16
+        if not _face_style(st.font_name or "", 0)[0]:
+            st.render_mode = 2
+            st.border_width = max(0.15, float(st.size or 11) * 0.035)
+    else:
+        st.flags &= ~16
+        st.render_mode = 0
+        st.border_width = 0.05
+        st.font_name = strip_face_tokens(st.font_name, bold=True)
+        st.display_name = font_display_label(st.font_name)
+    return st
+
+
+def set_style_italic(style, on: bool):
+    st = style.copy()
+    if on:
+        st.flags |= 2
+    else:
+        st.flags &= ~2
+        st.font_name = strip_face_tokens(st.font_name, italic=True)
+        st.display_name = font_display_label(st.font_name)
+    return st
 
 
 # ------------------------------------------------------- Windows 系统字体查找
@@ -557,6 +669,10 @@ class FontResolver:
         except Exception:
             return []
         wb, wi, _wl = _face_style(style.font_name or "", getattr(style, "flags", 0) or 0)
+        if getattr(style, "is_bold", False):
+            wb = True
+        if getattr(style, "is_italic", False):
+            wi = True
         scored = []
         for finfo in fonts:
             basefont = finfo[3] if len(finfo) > 3 else ""
@@ -608,6 +724,10 @@ class FontResolver:
         if base:
             wb, wi, wl = _face_style(style.font_name or "",
                                      getattr(style, "flags", 0) or 0)
+            if getattr(style, "is_bold", False):
+                wb = True
+            if getattr(style, "is_italic", False):
+                wi = True
             for path in system_font_candidates(base, bold=wb, italic=wi, light=wl):
                 f = self._load_file(path)
                 if f is not None and covers(f, text):
