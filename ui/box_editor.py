@@ -1,4 +1,7 @@
-"""文本框编辑覆盖层。"""
+"""文本框编辑覆盖层：光标、选区、输入法预编辑、虚线框。
+
+正文由 MuPDF 画在页面位图上，这里不再用 Qt 重绘字形。
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -9,7 +12,7 @@ from ui.handles import ACCENT
 
 
 class BoxEditorItem(QGraphicsItem):
-    """文本框编辑覆盖层：实时渲染缓冲内容、光标、选区、输入法预编辑。"""
+    """文本框编辑装饰层（不含正文）。"""
 
     def __init__(self, canvas):
         super().__init__()
@@ -29,11 +32,11 @@ class BoxEditorItem(QGraphicsItem):
         return QRectF(bb[0] - m, bb[1] - m, (bb[2] - bb[0]) + 2 * m,
                       (bb[3] - bb[1]) + 2 * m)
 
-    def _qfont(self, rf, st):
-        key = (getattr(rf, "key", ""), st.key)
+    def _qfont(self, rf, st, scale=1.0):
+        key = (getattr(rf, "key", ""), st.key, round(scale, 3))
         if key not in self._font_cache:
             from ui.overlay_fonts import qfont_for_style
-            self._font_cache[key] = qfont_for_style(rf, st)
+            self._font_cache[key] = qfont_for_style(rf, st, zoom=scale)
         return self._font_cache[key]
 
     def paint(self, painter, option, widget):
@@ -44,7 +47,8 @@ class BoxEditorItem(QGraphicsItem):
         buf = sess.buffer
         oracle = sess.oracle
         adv = oracle.adv_fn()
-        lh = buf.line_height
+        scale = buf.fit_scale if buf.fit_scale > 0 else 1.0
+        lh = buf.line_height * scale
 
         bb = buf.bbox()
         painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 160),
@@ -63,24 +67,10 @@ class BoxEditorItem(QGraphicsItem):
                     e2 = min(e, v.end)
                     if e2 <= s2:
                         continue
-                    hl = buf.hard_lines[hi]
-                    x0 = v.x + sum(adv(*hl[i]) for i in range(v.start, s2))
-                    x1 = v.x + sum(adv(*hl[i]) for i in range(v.start, e2))
-                    painter.drawRect(QRectF(x0, v.baseline - lh * 0.78,
+                    x0, bl0 = buf.cursor_pos((hi, s2), adv)
+                    x1, _bl1 = buf.cursor_pos((hi, e2), adv)
+                    painter.drawRect(QRectF(x0, bl0 - lh * 0.78,
                                             max(x1 - x0, 1.0), lh))
-
-        for v in buf.visual:
-            hl = buf.hard_lines[v.hard_idx]
-            cx = v.x
-            for i in range(v.start, v.end):
-                ch, st = hl[i]
-                rf = oracle.char_font(st, ch)
-                painter.setFont(self._qfont(rf, st))
-                painter.setPen(QColor(int(st.color[0] * 255),
-                                      int(st.color[1] * 255),
-                                      int(st.color[2] * 255)))
-                painter.drawText(QPointF(cx, v.baseline), ch)
-                cx += oracle.advance(st, ch)
 
         if self._blink_on and sess.preedit == "":
             x, bl = buf.cursor_pos(sess.cursor, adv)
@@ -92,7 +82,7 @@ class BoxEditorItem(QGraphicsItem):
         if sess.preedit:
             st = buf.style_at(sess.cursor)
             rf = oracle.char_font(st, "预")
-            f = self._qfont(rf, st)
+            f = self._qfont(rf, st, scale)
             painter.setFont(f)
             painter.setPen(QPen(QColor(ACCENT)))
             x, bl = buf.cursor_pos(sess.cursor, adv)

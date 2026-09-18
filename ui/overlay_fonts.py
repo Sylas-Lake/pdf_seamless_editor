@@ -1,5 +1,4 @@
-"""覆盖层字体注册：把 PDF 解析出的字体加载进 Qt，
-使编辑缓冲的实时渲染与最终 PDF 提交使用同一字体文件。"""
+"""覆盖层字体：仅用于输入法预编辑串。正文由 MuPDF 画在页面位图上。"""
 import hashlib
 
 from PySide6.QtGui import QFont, QFontDatabase
@@ -83,13 +82,13 @@ def fallback_family(style) -> str:
 
 
 def qfont_for_style(rf: ResolvedFont, style, zoom: float = 1.0) -> QFont:
-    """构造覆盖层 QFont（像素尺寸 = PDF 字号，场景单位 1:1）。"""
-    size = max(4.0, float(style.size if style else 12.0))
+    """构造覆盖层 QFont（像素尺寸 = PDF 字号 × 缩放，场景单位 1:1）。"""
+    size = max(4.0, float(style.size if style else 12.0) * max(zoom, 0.01))
     fam = family_for_rf(rf)
     if not fam:
         fam = fallback_family(style) or "Microsoft YaHei"
     f = QFont(fam)
-    f.setPixelSize(round(size))
+    f.setPixelSize(max(1, int(round(size))))
     if style is not None and style.is_bold:
         f.setBold(True)
     if style is not None and style.is_italic:

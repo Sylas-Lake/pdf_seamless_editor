@@ -17,13 +17,16 @@ class TextStyle:
     size: float = 11.0
     color: Rgb = (0.0, 0.0, 0.0)
     flags: int = 0
+    render_mode: int = 0          # PDF Tr：0 填充，2 填+描（假粗体）
+    border_width: float = 0.05
 
     def copy(self) -> "TextStyle":
         return replace(self)
 
     @property
     def key(self) -> tuple:
-        return (self.font_name, round(self.size, 3), self.color, self.flags)
+        return (self.font_name, round(self.size, 3), self.color, self.flags,
+                self.render_mode)
 
     @property
     def is_bold(self) -> bool:
@@ -32,6 +35,11 @@ class TextStyle:
     @property
     def is_italic(self) -> bool:
         return bool(self.flags & 2)
+
+    @property
+    def name_says_bold(self) -> bool:
+        n = (self.font_name or "").lower()
+        return any(w in n for w in ("bold", "black", "heavy", "semibold"))
 
 
 @dataclass

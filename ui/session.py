@@ -1,4 +1,4 @@
-"""文本框编辑会话（内存缓冲，提交前不写 PDF）。"""
+"""文本框编辑会话（未改动不写 PDF；改字后预览即提交路径）。"""
 from __future__ import annotations
 
 from core.fonts import FontOracle
@@ -20,3 +20,4 @@ class EditSession:
         self.cursor: tuple[int, int] = (0, 0)
         self.selection = None      # (anchor, focus) 框内缓冲坐标
         self.preedit = ""
+        self.previewed = False     # 已按提交路径写过当前页（改字后的 MuPDF 预览）

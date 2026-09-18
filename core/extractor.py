@@ -67,12 +67,21 @@ def extract_page(page, page_index: int) -> PageModel:
         for ln in block.get("lines", []):
             glyphs = []
             for span in ln.get("spans", []):
+                flags = int(span.get("flags", 0) or 0)
+                font_name = span.get("font", "") or ""
+                size = float(span.get("size", 11.0) or 11.0)
                 style = TextStyle(
-                    font_name=span.get("font", "") or "",
-                    size=float(span.get("size", 11.0) or 11.0),
+                    font_name=font_name,
+                    size=size,
                     color=_int_to_rgb(span.get("color", 0) or 0),
-                    flags=int(span.get("flags", 0) or 0),
+                    flags=flags,
                 )
+                # 粗体标记但字体名不含 Bold：按填+描假粗体重建，避免落下变细
+                n = font_name.lower()
+                if (flags & 16) and not any(
+                        w in n for w in ("bold", "black", "heavy", "semibold")):
+                    style.render_mode = 2
+                    style.border_width = max(0.15, size * 0.035)
                 for ch in span.get("chars", []):
                     c = ch.get("c", "")
                     if not c or c in ("\ufffe", "\uffff"):
@@ -125,6 +134,22 @@ def extract_page(page, page_index: int) -> PageModel:
             model.scanned_note = "页面为整页图像（扫描件）：文本编辑属图像/OCR 模式（红色保真）"
             break
     return model
+
+
+def line_redact_rects(block: "TextBlock", pad: float = 0.25) -> list[PdfRect]:
+    """本框各行字形墨水盒（小膨胀）。按行挖空，少伤行间/邻列的字。"""
+    rects = []
+    for ln in getattr(block, "lines", []) or []:
+        glyphs = getattr(ln, "glyphs", None) or []
+        if not glyphs:
+            continue
+        r = union_bbox([g.bbox for g in glyphs])
+        rects.append((r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad))
+    if not rects:
+        b = getattr(block, "bbox", None)
+        if b:
+            rects.append((b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad))
+    return rects
 
 
 def inherited_style(block: "TextBlock", line: "TextLine", idx: int) -> TextStyle:

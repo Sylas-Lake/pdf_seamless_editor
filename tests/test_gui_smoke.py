@@ -122,6 +122,22 @@ def test_gui_smoke(window):
 
         win.start_session(blk)
         check("会话建立", win.session is not None)
+        from core.snapshot import page_state_equal
+        from core import verifier
+        import numpy as np
+        from PIL import Image
+        check("进入会话不写页",
+              page_state_equal(win.doc, win.doc[win.page_no], win.session.before_state))
+        now = verifier.render_page_png(win.doc[0])
+        a1 = np.asarray(Image.open(io.BytesIO(win.orig_renders[0])).convert("RGB"))
+        a2 = np.asarray(Image.open(io.BytesIO(now)).convert("RGB"))
+        d0 = np.abs(a1.astype(np.int16) - a2.astype(np.int16)).sum(axis=2)
+        check("进入会话渲染不变", (d0 > 18).mean() < 0.0005, f"{(d0 > 18).mean():.5f}")
+        before = win.session.before_state
+        win.commit_session()
+        check("未改提交零写入", page_state_equal(win.doc, win.doc[0], before))
+        win.start_session(blk)
+        check("再次进入会话", win.session is not None)
         line0 = blk.lines[0].text()
         gi = line0.find("HT-2026-0917")
         win.session.cursor = (0, gi)
@@ -142,9 +158,6 @@ def test_gui_smoke(window):
         win.cancel_session()
         check("会话取消", win.session is None)
         check("取消后原文本", "HT-2026-0917" in win.doc[0].get_text())
-        from core import verifier
-        import numpy as np
-        from PIL import Image
         now = verifier.render_page_png(win.doc[0])
         a1 = np.asarray(Image.open(io.BytesIO(win.orig_renders[0])).convert("RGB"))
         a2 = np.asarray(Image.open(io.BytesIO(now)).convert("RGB"))
@@ -157,8 +170,14 @@ def test_gui_smoke(window):
         win.start_session(blk)
         win.session.cursor = (0, blk.lines[0].text().find("HT"))
         win.session_insert("NO-")
+        from core.snapshot import capture_page_state
+        after_preview = capture_page_state(win.doc, win.doc[0])
         win.commit_session()
+        after_commit = capture_page_state(win.doc, win.doc[0])
         check("提交后文本", "NO-HT-2026-0917" in win.doc[0].get_text())
+        check("预览即终态",
+              after_preview["contents"] == after_commit["contents"]
+              and after_preview["page_obj"] == after_commit["page_obj"])
         check("命令入栈", win.undo_stack.can_undo)
         win.undo()
         check("撤销回到原版", "HT-2026-0917" in win.doc[0].get_text()
@@ -224,6 +243,26 @@ def test_gui_smoke(window):
             back = any(abs(im.rect[2] - im.rect[0] - (old[2] - old[0])) < 1
                        for im in m1c.images)
             check("图片撤销（字节级）", back)
+
+    win.status_hint("溢出策略已切换")
+    check("提示条可见", win.canvas.hint_text() == "溢出策略已切换")
+    win.set_overflow_strategy("keep")
+    check("溢出策略 keep", win.overflow_strategy() == "keep")
+    win.set_overflow_strategy("shrink")
+    check("溢出策略 shrink", win.overflow_strategy() == "shrink")
+    win.set_page(0)
+    app.processEvents()
+    model = win.page_model()
+    blk = next((b for b in model.blocks if "HT-2026-0917" in b.text()), None)
+    check("样式测试定位文本框", blk is not None)
+    if blk:
+        win.start_session(blk)
+        win.apply_session_style(20.0, (0.1, 0.2, 0.3))
+        st = win.current_style()
+        check("会话应用字号", st is not None and abs(st.size - 20.0) < 0.05)
+        check("应用样式后缓冲已改", win.session.buffer.changed)
+        win.cancel_session()
+        check("样式取消恢复", win.session is None)
 
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)

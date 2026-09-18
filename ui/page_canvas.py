@@ -122,6 +122,11 @@ class PageCanvas(QGraphicsView):
         self.hint_item.setPlainText(text)
         self.hint_item.setVisible(bool(text))
 
+    def hint_text(self) -> str:
+        if not self.hint_item.isVisible():
+            return ""
+        return self.hint_item.toPlainText()
+
     def session_active(self):
         return self.controller.session is not None
 
