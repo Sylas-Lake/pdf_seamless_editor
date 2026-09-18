@@ -1,5 +1,4 @@
 """保存验证报告对话框：结构校验 + 前后视觉对比 + 差异图。"""
-import io
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap

@@ -5,14 +5,17 @@
 撤销/重做通过页面状态快照字节级恢复。
 """
 from dataclasses import dataclass, field, replace
+from typing import Optional
+
+from .types import PdfRect, Point, Rgb
 
 
 @dataclass
 class TextStyle:
     """文本样式（继承自原 PDF span，用于样式继承）。"""
-    font_name: str = ""          # 原始 PDF 字体名（可能带子集前缀）
+    font_name: str = ""
     size: float = 11.0
-    color: tuple = (0.0, 0.0, 0.0)
+    color: Rgb = (0.0, 0.0, 0.0)
     flags: int = 0
 
     def copy(self) -> "TextStyle":
@@ -35,19 +38,19 @@ class TextStyle:
 class GlyphNode:
     """可见字形（grapheme 粒度，组合字符并入前一字符）。"""
     char: str
-    bbox: tuple
-    origin: tuple
-    style: TextStyle = None
+    bbox: PdfRect
+    origin: Point
+    style: Optional[TextStyle] = None
 
 
 @dataclass
 class TextLine:
     """文本行（框内）。"""
     index: int
-    bbox: tuple
+    bbox: PdfRect
     baseline: float
-    glyphs: list = field(default_factory=list)
-    direction: tuple = (1.0, 0.0)
+    glyphs: list[GlyphNode] = field(default_factory=list)
+    direction: Point = (1.0, 0.0)
 
     @property
     def horizontal(self) -> bool:
@@ -61,8 +64,8 @@ class TextLine:
 class TextBlock:
     """文本框：视觉上的一个文本区域（PDF block 推断）。"""
     index: int
-    bbox: tuple
-    lines: list = field(default_factory=list)   # TextLine 列表
+    bbox: PdfRect
+    lines: list[TextLine] = field(default_factory=list)
 
     @property
     def horizontal(self) -> bool:
@@ -95,7 +98,7 @@ class TextBlock:
 class ImageObject:
     """页面图片对象。"""
     xref: int
-    rect: tuple
+    rect: PdfRect
     width: int = 0
     height: int = 0
     deg: float = 0.0
@@ -105,14 +108,14 @@ class ImageObject:
 class PageModel:
     """页面视觉语义模型。"""
     page_index: int
-    rect: tuple
+    rect: PdfRect
     rotation: int = 0
-    blocks: list = field(default_factory=list)   # TextBlock 列表
-    images: list = field(default_factory=list)
+    blocks: list[TextBlock] = field(default_factory=list)
+    images: list[ImageObject] = field(default_factory=list)
     scanned: bool = False
     scanned_note: str = ""
 
-    def block_at(self, x: float, y: float):
+    def block_at(self, x: float, y: float) -> Optional[TextBlock]:
         """命中测试：返回包含点的最小文本框（无则 None）。"""
         best, best_area = None, None
         for b in self.blocks:
@@ -123,7 +126,7 @@ class PageModel:
                     best, best_area = b, area
         return best
 
-    def image_at(self, x: float, y: float):
+    def image_at(self, x: float, y: float) -> Optional[ImageObject]:
         """命中测试：返回包含点的最上层图片（后绘制者优先）。"""
         for img in reversed(self.images):
             r = img.rect

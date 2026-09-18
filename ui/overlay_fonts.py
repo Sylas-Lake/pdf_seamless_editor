@@ -4,10 +4,7 @@ import hashlib
 
 from PySide6.QtGui import QFont, QFontDatabase
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from core.compat import fitz
 
 from core.fonts import ResolvedFont
 

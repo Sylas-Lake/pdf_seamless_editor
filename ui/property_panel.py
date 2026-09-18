@@ -2,7 +2,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QColorDialog, QComboBox, QDoubleSpinBox,
-                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QFormLayout, QGroupBox, QLabel,
                                QListWidget, QPushButton, QVBoxLayout,
                                QWidget)
 

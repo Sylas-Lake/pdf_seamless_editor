@@ -18,56 +18,45 @@
 | 路径 | 职责 |
 |------|------|
 | `core/` | 模型、提取、字体、执行器、命令、快照、保真、校验。无 Qt。 |
-| `ui/` | PySide6：选中 / 双击进会话 / 画布叠加 / 属性栏。不直接改内容流。 |
-| `main.py` | 启动。 |
-| `selftest.py` | 无头全链路。改 `core/` 必须能过。 |
-| `smoke_gui.py` | GUI 会话链路。改交互必须能过。 |
+| `core/compat.py` | 唯一的 PyMuPDF 导入点。 |
+| `ui/main_window.py` | 文档与编辑会话控制器。 |
+| `ui/stage.py` / `ui/chrome.py` | 抽屉舞台、图标栏。 |
+| `ui/page_canvas.py` | 页面交互。手柄/覆盖层在 `handles.py`、`box_editor.py`。 |
+| `ui/` 其它 | 不直接改内容流。 |
+| `tests/` | pytest。改 `core/` 必须过 `-m "not gui"`；改交互必须过 `-m gui`。 |
 
-PyMuPDF 统一写成：
+## 编辑会话
 
-```python
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
-```
-
-## 编辑会话（`ui/main_window.py`）
-
-- 单击选中，双击进入 `EditSession`。
-- 会话中输入、退格、换行只动 `BoxBuffer` 与光标/选区。
+- 单击选中，双击进入 `EditSession`（`ui/session.py`）。
+- 会话中输入只动 `BoxBuffer`。
 - 失焦、换页、保存前要提交当前会话。
-- 提交后立刻 `PageStateCommand` 入栈，并记录 `edit_rects` 供视觉回归。
+- 提交后 `PageStateCommand` 入栈，并记录 `edit_rects`。
 
-溢出默认策略是 `shrink`（缩小字号适配框）。左右拖动手柄后框宽锁定并换行；未锁定时框随内容变宽。
+溢出默认 `shrink`。未锁定框宽时随内容变宽。
 
-## 字体（`core/fonts.py`）
+## 字体
 
-优先级：原嵌入子集能覆盖 → 系统同名完整字体 → 内置 CJK / Base14。  
-缺字不要静默画方框；应走替代并下调保真等级（绿 → 黄）。扫描页走红色。
+原嵌入子集能覆盖 → 系统同名完整字体 → 内置 CJK / Base14。  
+缺字走替代并下调保真（绿 → 黄）。扫描页红色。
 
 ## 几何
 
-PDF 矩形是 `(x0, y0, x2, y2)`。交给 Qt 时用 `core.geom.qrect_args`（宽高，不是对角点）。图片缩放默认所见即所得，不要擅自 `keep_proportion=True`，除非调用方明确要求等比。
+PDF 矩形 `(x0, y0, x2, y2)`。交给 Qt 用 `core.geom.qrect_args`。图片缩放默认所见即所得。
+
+## 测试约定
+
+- 新逻辑写进 `tests/`，用 `assert`，不要再往 `selftest.py` 堆全局计数。
+- GUI 测试只调用公开 API（例如 `page_model()`、`chrome.tool_action_names()`、`canvas.try_turn_page()`）。
+- 不要测 `_*` 私有属性。
+
+```bash
+pytest -m "not gui"
+pytest -m gui
+ruff check core ui tests main.py
+```
 
 ## 改动范围
 
-- 只改与任务相关的文件。不要顺手重构、不要加无关依赖。
-- 不要新增覆盖层作为主编辑路径（例如只画 QGraphicsTextItem 却不写回 PDF）。
+- 不要新增覆盖层作为主编辑路径。
 - 不要在 GUI 里绕过 `executor` 直接 `insert_text` / 画白块。
 - 用户未要求时不要提交 git、不要改远程。
-
-## 验证
-
-```bash
-python selftest.py
-python smoke_gui.py    # 改了 ui/ 时
-```
-
-`selftest.py` 覆盖：提取、BoxBuffer、快照撤销零差异、框移动、图片变换、保存后可搜索且无游离残骸。失败项修到通过再结束。
-
-## 语言与风格
-
-- 用户对话用中文。代码注释、提交说明沿用仓库现有中文。
-- 保持现有模块切分与 dataclass 风格，不要上大型框架。
-- 新增测试用 `check(name, cond)` 模式，与 `selftest.py` / `smoke_gui.py` 一致。

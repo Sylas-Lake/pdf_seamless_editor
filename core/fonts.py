@@ -7,10 +7,7 @@
 """
 import os
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .compat import fitz
 
 from .extractor import _is_mark
 

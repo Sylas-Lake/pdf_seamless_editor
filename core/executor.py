@@ -5,11 +5,10 @@
 - place_image：图片移动/缩放/旋转（keep_proportion=False 保证所见即所得）。
 """
 import io
+from collections.abc import Iterable, Sequence
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    import fitz
+from .compat import fitz
+from .types import PdfRect
 
 try:
     from PIL import Image
@@ -33,7 +32,7 @@ def _redact_params(page):
         return False, False
 
 
-def apply_redact(page, rects, *, images, graphics=ART_NONE, text=None):
+def apply_redact(page, rects: Iterable[PdfRect], *, images, graphics=ART_NONE, text=None):
     """添加并应用一批 redaction（真正的删除，不绘制遮盖）。"""
     for r in rects:
         page.add_redact_annot(fitz.Rect(r))
@@ -46,12 +45,12 @@ def apply_redact(page, rects, *, images, graphics=ART_NONE, text=None):
     page.apply_redactions(**kwargs)
 
 
-def remove_text_region(page, rect):
+def remove_text_region(page, rect: PdfRect):
     """清除一个文本区域的全部文字（保留图片与矢量图形）。"""
     apply_redact(page, [rect], images=IMG_NONE, graphics=ART_NONE)
 
 
-def insert_runs(page, runs, resolver):
+def insert_runs(page, runs: Sequence, resolver):
     """按提交序列插入文本：[(text, style, x, baseline, rf), ...]"""
     for text, style, x, baseline, rf in runs:
         if not text:
@@ -61,7 +60,7 @@ def insert_runs(page, runs, resolver):
                          fontsize=style.size, color=style.color)
 
 
-def image_blob(doc, xref: int):
+def image_blob(doc, xref: int) -> bytes | None:
     """提取图片原始字节。"""
     info = doc.extract_image(xref)
     if isinstance(info, dict):
@@ -71,7 +70,8 @@ def image_blob(doc, xref: int):
     return None
 
 
-def place_image(doc, page, remove_rects, new_rect, deg: float, blob: bytes):
+def place_image(doc, page, remove_rects: Sequence[PdfRect] | None,
+                new_rect: PdfRect | None, deg: float, blob: bytes):
     """图片移动/缩放/旋转：移除原实例（仅图片），于新位置精确重插。
     keep_proportion=False → 手柄所见即所得。"""
     if remove_rects:

@@ -6,24 +6,31 @@
 撤销 = 恢复 before（字节级原版），重做 = 恢复 after。
 不存在"重新插入模拟"，彻底解决撤销无法回到原版的问题。
 """
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
 from . import executor
-from .snapshot import capture_page_state, restore_page_state
+from .snapshot import restore_page_state
+from .types import PageState
 
 
 class Command:
     title = "编辑"
 
-    def apply(self, ctx):
+    def apply(self, ctx: Any) -> list:
         raise NotImplementedError
 
-    def undo(self, ctx):
+    def undo(self, ctx: Any) -> list:
         raise NotImplementedError
 
 
 class PageStateCommand(Command):
     """通用页面状态命令（文本框编辑 / 框移动缩放 / 图片变换）。"""
 
-    def __init__(self, title, page_index, before_state, after_state):
+    def __init__(self, title: str, page_index: int,
+                 before_state: PageState, after_state: PageState):
         self.title = title
         self.page_index = page_index
         self.before = before_state
@@ -88,7 +95,7 @@ class ImageReplaceCommand(Command):
 class UndoStack:
     """命令栈（上限 200）。"""
 
-    def __init__(self, limit=200, on_change=None):
+    def __init__(self, limit: int = 200, on_change: Callable[[], None] | None = None):
         self.limit = limit
         self._undo = []
         self._redo = []
