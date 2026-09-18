@@ -416,7 +416,6 @@ class MainWindow(QMainWindow):
             return
         page = self.current_page()
         before = capture_page_state(self.doc, page)
-        executor.remove_text_region(page, _expand(block.bbox, 0.6))
         buffer = BoxBuffer(block)
         oracle = FontOracle(self.resolver, page)
         buffer.set_measure(oracle.adv_fn())
@@ -424,12 +423,35 @@ class MainWindow(QMainWindow):
         self.session = sess
         self.selected_block = None
         self.selected_image = None
-        # 光标置于框首（双击路径会按点击位置再定位）
         sess.cursor = (0, 0)
-        self._refresh_render_only()
         self.canvas.refresh_overlays()
         self.canvas._grab_focus()
         self.status_hint("编辑中：单击定位，拖选/双击选词，Enter 换行，Esc 取消，点击框外提交")
+        self._update_panels()
+
+    def _sync_session_preview(self):
+        """缓冲已变则按提交路径重写当前页并重绘；恢复未改动则还原原页。"""
+        sess = self.session
+        if sess is None:
+            return
+        page_index = sess.page_index
+        if not sess.buffer.changed:
+            if sess.previewed:
+                restore_page_state(self.doc, self.doc[page_index], sess.before_state)
+                sess.previewed = False
+                sess.oracle.page = self.doc[page_index]
+                self._refresh_render_only()
+            self.canvas.refresh_overlays()
+            self._update_panels()
+            return
+        runs = sess.buffer.commit_runs(sess.oracle)
+        page = executor.apply_box_rebuild(
+            self.doc, page_index, sess.before_state,
+            _expand(sess.block.bbox, 0.6), runs, self.resolver)
+        sess.oracle.page = page
+        sess.previewed = True
+        self._refresh_render_only()
+        self.canvas.refresh_overlays()
         self._update_panels()
 
     def commit_session(self):
@@ -438,14 +460,21 @@ class MainWindow(QMainWindow):
             return
         self.session = None
         self.session_preedit_clear()
-        page = self.current_page()
         if not sess.buffer.changed:
-            # 无变化：字节级还原
-            restore_page_state(self.doc, page, sess.before_state)
-            self._refresh_page()
+            if sess.previewed:
+                restore_page_state(self.doc, self.doc[sess.page_index],
+                                   sess.before_state)
+                self._refresh_page()
+            else:
+                self.canvas.refresh_overlays()
+                self._update_panels()
             return
         runs = sess.buffer.commit_runs(sess.oracle)
-        executor.insert_runs(page, runs, self.resolver)
+        if not sess.previewed:
+            executor.apply_box_rebuild(
+                self.doc, sess.page_index, sess.before_state,
+                _expand(sess.block.bbox, 0.6), runs, self.resolver)
+        page = self.doc[sess.page_index]
         after = capture_page_state(self.doc, page)
         cmd = PageStateCommand("编辑文本框", self.page_no,
                                sess.before_state, after)
@@ -459,9 +488,13 @@ class MainWindow(QMainWindow):
             return
         self.session = None
         self.session_preedit_clear()
-        page = self.current_page()
-        restore_page_state(self.doc, page, sess.before_state)
-        self._refresh_page()
+        if sess.previewed:
+            restore_page_state(self.doc, self.doc[sess.page_index],
+                               sess.before_state)
+            self._refresh_page()
+        else:
+            self.canvas.refresh_overlays()
+            self._update_panels()
         self.status_hint("已取消编辑（字节级恢复原版）")
 
     def _register_cmd(self, cmd, buffer=None, runs=None):
@@ -564,8 +597,7 @@ class MainWindow(QMainWindow):
         if sess.selection:
             sess.cursor = self._session_delete_selection()
         sess.cursor = sess.buffer.insert(sess.cursor, text)
-        self.canvas.refresh_overlays()
-        self._update_panels()
+        self._sync_session_preview()
 
     def session_split_line(self):
         sess = self.session
@@ -574,7 +606,7 @@ class MainWindow(QMainWindow):
         if sess.selection:
             self._session_delete_selection()
         sess.cursor = sess.buffer.split_line(sess.cursor)
-        self.canvas.refresh_overlays()
+        self._sync_session_preview()
 
     def session_backspace(self):
         sess = self.session
@@ -584,7 +616,7 @@ class MainWindow(QMainWindow):
             sess.cursor = self._session_delete_selection()
         else:
             sess.cursor = sess.buffer.backspace(sess.cursor)
-        self.canvas.refresh_overlays()
+        self._sync_session_preview()
 
     def session_delete_forward(self):
         sess = self.session
@@ -594,7 +626,7 @@ class MainWindow(QMainWindow):
             sess.cursor = self._session_delete_selection()
         else:
             sess.cursor = sess.buffer.delete_forward(sess.cursor)
-        self.canvas.refresh_overlays()
+        self._sync_session_preview()
 
     def _session_delete_selection(self):
         sess = self.session
@@ -712,7 +744,7 @@ class MainWindow(QMainWindow):
         if t:
             QApplication.clipboard().setText(t)
             sess.cursor = self._session_delete_selection()
-            self.canvas.refresh_overlays()
+            self._sync_session_preview()
 
     def paste(self):
         sess = self.session

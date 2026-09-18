@@ -1,5 +1,4 @@
-"""覆盖层字体注册：把 PDF 解析出的字体加载进 Qt，
-使编辑缓冲的实时渲染与最终 PDF 提交使用同一字体文件。"""
+"""覆盖层字体：仅用于输入法预编辑串。正文由 MuPDF 画在页面位图上。"""
 import hashlib
 
 from PySide6.QtGui import QFont, QFontDatabase

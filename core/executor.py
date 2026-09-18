@@ -2,6 +2,7 @@
 
 - remove_text_region：Redaction 真删除（fill=False 不遮盖底图）；
 - insert_runs：按可视行 Run 原位插入（提交时一次完成）；
+- apply_box_rebuild：恢复快照后 redact + 插入（预览与提交共用）；
 - place_image：图片移动/缩放/旋转（keep_proportion=False 保证所见即所得）。
 """
 import io
@@ -58,6 +59,18 @@ def insert_runs(page, runs: Sequence, resolver):
         key = resolver.ensure_page_font(page, rf)
         page.insert_text(fitz.Point(x, baseline), text, fontname=key,
                          fontsize=style.size, color=style.color)
+
+
+def apply_box_rebuild(doc, page_index: int, before_state, rect: PdfRect,
+                      runs: Sequence, resolver):
+    """预览 = 提交：恢复原页 → redact 原框 → insert_runs。返回当前页对象。"""
+    from .snapshot import restore_page_state
+    page = doc[page_index]
+    restore_page_state(doc, page, before_state)
+    page = doc[page_index]
+    remove_text_region(page, rect)
+    insert_runs(page, runs, resolver)
+    return doc[page_index]
 
 
 def image_blob(doc, xref: int) -> bytes | None:
