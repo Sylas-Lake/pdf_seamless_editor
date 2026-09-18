@@ -78,6 +78,11 @@ def insert_runs(page, runs: Sequence, resolver):
         if rm:
             kwargs["render_mode"] = rm
             kwargs["border_width"] = getattr(style, "border_width", 0.05) or 0.05
+        name = (getattr(style, "font_name", "") or "").lower()
+        if (getattr(style, "is_italic", False)
+                and "italic" not in name and "oblique" not in name):
+            kwargs["morph"] = (fitz.Point(x, baseline),
+                               fitz.Matrix(1, 0, 0.22, 1, 0, 0))
         page.insert_text(fitz.Point(x, baseline), text, **kwargs)
 
 

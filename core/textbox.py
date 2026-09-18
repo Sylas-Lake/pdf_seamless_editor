@@ -40,6 +40,12 @@ class BoxBuffer:
         self._src_origin = []     # 与 hard_lines 平行：原始 PDF origin 或 None
         self._src_id = []         # 与 hard_lines 平行：(原行, 原下标) 或 None
         self._glyph_pos = []      # 布局后每字 (x, baseline)
+        self.overflow = "shrink"  # shrink | keep
+        self.fit_scale = 1.0
+        self.overflowed = False
+        self.tracking = 0.0
+        self._cap_height = 20.0
+        self._style_dirty = False
         if block is not None:
             self._from_block(block)
 
@@ -68,7 +74,9 @@ class BoxBuffer:
             self.line_height = block.dominant_style().size * 1.35
         if self.line_height <= 0.5:
             self.line_height = block.dominant_style().size * 1.35
+        self._cap_height = max(b[3] - b[1], self.line_height)
         self._origin_text = self.text()
+        self._style_dirty = False
         self.layout()
         self._orig_visual_count = len(self.visual)
 
@@ -106,7 +114,7 @@ class BoxBuffer:
 
     @property
     def changed(self) -> bool:
-        return self.text() != self._origin_text
+        return self.text() != self._origin_text or self._style_dirty
 
     def char_count(self) -> int:
         return sum(len(hl) for hl in self.hard_lines)
@@ -129,24 +137,45 @@ class BoxBuffer:
             return st.size * 0.5
         return approx
 
+    def _scaled_measure(self, adv_fn=None):
+        adv_fn = self._measure(adv_fn)
+        k = self.fit_scale if self.fit_scale > 0 else 1.0
+        return self._scale_adv(adv_fn, k)
+
+    @staticmethod
+    def _scale_adv(adv_fn, k):
+        if abs(k - 1.0) < 1e-6:
+            return adv_fn
+
+        def scaled(ch, st, f=adv_fn, factor=k):
+            return f(ch, st) * factor
+        return scaled
+
     # ------------------------------------------------ 布局
-    def _place_origin_line(self, hi, hl, default_bl, adv_fn):
+    def _place_origin_line(self, hi, hl, default_bl, adv_fn, scale=1.0, tracking=0.0):
         """不换行时按原始 origin 摆字：插入后移、删除合拢、TJ 间距保留。"""
         n = len(hl)
         if n == 0:
             return []
         origins = list(self._src_origin[hi]) if hi < len(self._src_origin) else []
         ids = list(self._src_id[hi]) if hi < len(self._src_id) else []
+
+        def _sx(x, y):
+            if scale == 1.0:
+                return x, y
+            return (self.box_left + (x - self.box_left) * scale,
+                    self.first_baseline + (y - self.first_baseline) * scale)
+
         if len(origins) != n or len(ids) != n:
             pos, x = [], self.box_left
             for ch, st in hl:
                 pos.append((x, default_bl))
-                x += adv_fn(ch, st)
+                x += adv_fn(ch, st) + tracking
             return pos
         anchor_x, anchor_bl = self.box_left, default_bl
         for src in origins:
             if src is not None:
-                anchor_x, anchor_bl = src
+                anchor_x, anchor_bl = _sx(src[0], src[1])
                 break
         pos = [None] * n
         shift = 0.0
@@ -158,7 +187,7 @@ class BoxBuffer:
             src = origins[i]
             gid = ids[i]
             if src is not None and gid is not None:
-                x0, y0 = src
+                x0, y0 = _sx(src[0], src[1])
                 consecutive = (prev_id is not None
                                and gid[0] == prev_id[0]
                                and gid[1] == prev_id[1] + 1)
@@ -176,43 +205,80 @@ class BoxBuffer:
                 if prev_end_x is None:
                     x, bl = anchor_x, anchor_bl
                 else:
-                    x = prev_end_x
+                    x = prev_end_x + tracking
                 pos[i] = (x, bl)
                 prev_end_x = x + w
-                shift += w
+                shift += w + tracking
         return pos
 
-    def layout(self, adv_fn=None):
-        """断行 + 基线（adv_fn(char, style) → advance，None 用已绑定度量或字号近似）。"""
-        adv_fn = self._measure(adv_fn)
-        wrap_w = None if self.auto_width else self.width
+    def _estimate_tracking(self, adv_fn):
+        """原相邻字形 origin 差 − 字体 advance，即 Tc 一类额外字距。"""
+        gaps = []
+        for hi, hl in enumerate(self.hard_lines):
+            origins = self._src_origin[hi] if hi < len(self._src_origin) else []
+            ids = self._src_id[hi] if hi < len(self._src_id) else []
+            for i in range(len(hl) - 1):
+                if i + 1 >= len(origins) or origins[i] is None or origins[i + 1] is None:
+                    continue
+                if not ids or i + 1 >= len(ids) or ids[i] is None or ids[i + 1] is None:
+                    continue
+                if ids[i][0] != ids[i + 1][0] or ids[i][1] + 1 != ids[i + 1][1]:
+                    continue
+                gap = origins[i + 1][0] - origins[i][0] - adv_fn(*hl[i])
+                if abs(gap) < 5.0:
+                    gaps.append(gap)
+        if not gaps:
+            return 0.0
+        gaps.sort()
+        med = gaps[len(gaps) // 2]
+        return med if abs(med) >= 0.05 else 0.0
+
+    def _natural_width(self, adv_fn):
+        widest = 0.0
+        for hi, hl in enumerate(self.hard_lines):
+            if not hl:
+                continue
+            pos = self._place_origin_line(hi, hl, self.first_baseline, adv_fn)
+            last = pos[-1][0] + adv_fn(*hl[-1])
+            widest = max(widest, last - self.box_left)
+        return widest
+
+    def _layout_origin(self, adv_fn, scale):
+        scaled = self._scale_adv(adv_fn, scale)
+        track = self.tracking * scale
         self.visual = []
         self._glyph_pos = [[] for _ in self.hard_lines]
         baseline = self.first_baseline
         max_w = 0.0
-        if wrap_w is None:
-            for hi, hl in enumerate(self.hard_lines):
-                pos = self._place_origin_line(hi, hl, baseline, adv_fn)
-                self._glyph_pos[hi] = pos
-                if not hl:
-                    self.visual.append(VisualLine(hi, 0, 0, self.box_left, baseline))
-                else:
-                    x0, bl0 = pos[0]
-                    last_x = pos[-1][0] + adv_fn(*hl[-1])
-                    seg_w = last_x - x0
-                    self.visual.append(VisualLine(hi, 0, len(hl), x0, bl0, seg_w))
-                    max_w = max(max_w, last_x - self.box_left, seg_w)
-                if pos:
-                    baseline = pos[0][1] + self.line_height
-                else:
-                    baseline += self.line_height
+        lh = self.line_height * scale
+        for hi, hl in enumerate(self.hard_lines):
+            pos = self._place_origin_line(hi, hl, baseline, scaled, scale, track)
+            self._glyph_pos[hi] = pos
+            if not hl:
+                self.visual.append(VisualLine(hi, 0, 0, self.box_left, baseline))
+            else:
+                x0, bl0 = pos[0]
+                last_x = pos[-1][0] + scaled(*hl[-1])
+                seg_w = last_x - x0
+                self.visual.append(VisualLine(hi, 0, len(hl), x0, bl0, seg_w))
+                max_w = max(max_w, last_x - self.box_left, seg_w)
+            if pos:
+                baseline = pos[0][1] + lh
+            else:
+                baseline += lh
+        if self.auto_width:
             self.width = max(self.min_width, max_w)
-            return
+
+    def _layout_wrap(self, adv_fn, wrap_w, line_height):
+        self.visual = []
+        self._glyph_pos = [[] for _ in self.hard_lines]
+        baseline = self.first_baseline
+        max_w = 0.0
         for hi, hl in enumerate(self.hard_lines):
             self._glyph_pos[hi] = [(self.box_left, baseline)] * len(hl)
             if not hl:
                 self.visual.append(VisualLine(hi, 0, 0, self.box_left, baseline))
-                baseline += self.line_height
+                baseline += line_height
                 continue
             start = 0
             cur_w = 0.0
@@ -233,7 +299,7 @@ class BoxBuffer:
                         self._glyph_pos[hi][k] = (cx, baseline)
                         cx += adv_fn(*hl[k])
                     max_w = max(max_w, seg_w)
-                    baseline += self.line_height
+                    baseline += line_height
                     start = end
                     while start < len(hl) and hl[start][0].isspace():
                         start += 1
@@ -251,12 +317,46 @@ class BoxBuffer:
                     self._glyph_pos[hi][k] = (cx, baseline)
                     cx += adv_fn(*hl[k])
                 max_w = max(max_w, seg_w)
-            baseline += self.line_height
+            baseline += line_height
+
+    def layout(self, adv_fn=None):
+        """断行 + 基线（adv_fn(char, style) → advance，None 用已绑定度量或字号近似）。"""
+        adv_fn = self._measure(adv_fn)
+        self.tracking = self._estimate_tracking(adv_fn)
+        self.fit_scale = 1.0
+        self.overflowed = False
+        if self.auto_width:
+            self._layout_origin(adv_fn, 1.0)
+            return
+        wrap_w = self.width
+        if self.overflow == "shrink":
+            nat = max(self._natural_width(adv_fn), 0.01)
+            n = max(1, len([hl for hl in self.hard_lines if hl]) or 1)
+            cap = max(self._cap_height, self.line_height)
+            scale = min(1.0, wrap_w / nat)
+            if n * self.line_height > cap + 0.5:
+                scale = min(scale, cap / (n * self.line_height))
+            self.fit_scale = max(0.45, scale)
+            scaled = self._scale_adv(adv_fn, self.fit_scale)
+            if nat * self.fit_scale <= wrap_w + 0.5:
+                self._layout_origin(adv_fn, self.fit_scale)
+                return
+            self._layout_wrap(scaled, wrap_w, self.line_height * self.fit_scale)
+            return
+        self._layout_wrap(adv_fn, wrap_w, self.line_height)
+        widest = max((v.width for v in self.visual), default=0.0)
+        bottom = self.first_baseline
+        if self.visual:
+            bottom = self.visual[-1].baseline + self.line_height * 0.35
+        self.overflowed = (widest > wrap_w + 0.5
+                           or bottom - (self.first_baseline - self.line_height)
+                           > self._cap_height + 1.0)
 
     def bbox(self) -> tuple:
         """缓冲内容包围盒（含底部）。锁定宽度时框宽取 wrap 宽，否则随最长行。"""
-        pad = max(2.0, self.line_height * 0.06)
-        adv_fn = self._measure()
+        lh = self.line_height * (self.fit_scale if self.fit_scale > 0 else 1.0)
+        pad = max(2.0, lh * 0.06)
+        adv_fn = self._scaled_measure()
         xs, tops, bottoms = [], [], []
         for hi, hl in enumerate(self.hard_lines):
             pos = self._glyph_pos[hi] if hi < len(self._glyph_pos) else []
@@ -266,11 +366,11 @@ class BoxBuffer:
                 x, bl = pos[i]
                 xs.append(x)
                 xs.append(x + adv_fn(ch, st))
-                tops.append(bl - self.line_height * 0.85)
-                bottoms.append(bl + self.line_height * 0.35)
+                tops.append(bl - lh * 0.85)
+                bottoms.append(bl + lh * 0.35)
         if not xs:
             return (self.box_left - pad,
-                    self.first_baseline - self.line_height,
+                    self.first_baseline - lh,
                     self.box_left + self.width + pad, self.first_baseline)
         if not self.auto_width:
             left = self.box_left
@@ -288,7 +388,7 @@ class BoxBuffer:
         hl_idx, off = cursor
         if not (0 <= hl_idx < len(self.hard_lines)):
             return (self.box_left, self.first_baseline)
-        adv_fn = self._measure(adv_fn)
+        adv_fn = self._scaled_measure(adv_fn)
         hl = self.hard_lines[hl_idx]
         off = max(0, min(off, len(hl)))
         pos = self._glyph_pos[hl_idx] if hl_idx < len(self._glyph_pos) else []
@@ -309,7 +409,7 @@ class BoxBuffer:
 
     def hit_test(self, x: float, y: float, adv_fn=None) -> tuple:
         """页面坐标 → 光标 (硬行, 偏移)。"""
-        adv_fn = self._measure(adv_fn)
+        adv_fn = self._scaled_measure(adv_fn)
         best_v, best_d = None, None
         for v in self.visual:
             d = abs(y - v.baseline)
@@ -348,6 +448,29 @@ class BoxBuffer:
                 if 0 <= j < len(self.hard_lines) and self.hard_lines[j]:
                     return self.hard_lines[j][0][1].copy()
         return TextStyle()
+
+    def apply_style(self, size=None, color=None, selection=None):
+        """把字号/颜色应用到选区；无选区则整框。"""
+        if size is None and color is None:
+            return
+        if selection:
+            ranges = self.selection_range(*selection)
+        else:
+            ranges = [(hi, 0, len(hl)) for hi, hl in enumerate(self.hard_lines)]
+        for hi, s, e in ranges:
+            hl = self.hard_lines[hi]
+            for i in range(s, e):
+                ch, st = hl[i]
+                st = st.copy()
+                if size is not None:
+                    st.size = float(size)
+                    if st.render_mode:
+                        st.border_width = max(0.15, st.size * 0.035)
+                if color is not None:
+                    st.color = tuple(color)
+                hl[i] = (ch, st)
+        self._style_dirty = True
+        self.layout()
 
     def insert(self, cursor: tuple, text: str) -> tuple:
         """插入文本，返回新光标。"""
@@ -532,6 +655,7 @@ class BoxBuffer:
         """把缓冲序列化为提交序列：
         [ (text, style, x, baseline, rf) ... ]（按可视行、Run 分组）"""
         runs = []
+        scale = self.fit_scale if self.fit_scale > 0 else 1.0
         for v in self.visual:
             hl = self.hard_lines[v.hard_idx]
             pos = (self._glyph_pos[v.hard_idx]
@@ -541,9 +665,15 @@ class BoxBuffer:
                 ch, st = hl[i]
                 rf = oracle.char_font(st, ch)
                 x, bl = pos[i] if i < len(pos) else (v.x, v.baseline)
+                st_out = st
+                if abs(scale - 1.0) > 1e-4:
+                    st_out = st.copy()
+                    st_out.size = st.size * scale
+                    if st_out.border_width:
+                        st_out.border_width *= scale
                 j = i + 1
                 text = ch
-                cx = x + oracle.advance(st, ch)
+                cx = x + oracle.advance(st, ch) * scale
                 while j < v.end:
                     cj, sj = hl[j]
                     rfj = oracle.char_font(sj, cj)
@@ -551,10 +681,10 @@ class BoxBuffer:
                     if (rfj.key == rf.key and sj.key == st.key
                             and abs(pj[0] - cx) < 0.05 and abs(pj[1] - bl) < 0.05):
                         text += cj
-                        cx += oracle.advance(sj, cj)
+                        cx += oracle.advance(sj, cj) * scale
                         j += 1
                     else:
                         break
-                runs.append((text, st, x, bl, rf))
+                runs.append((text, st_out, x, bl, rf))
                 i = j
         return runs

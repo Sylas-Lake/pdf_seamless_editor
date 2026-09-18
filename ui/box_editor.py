@@ -32,11 +32,11 @@ class BoxEditorItem(QGraphicsItem):
         return QRectF(bb[0] - m, bb[1] - m, (bb[2] - bb[0]) + 2 * m,
                       (bb[3] - bb[1]) + 2 * m)
 
-    def _qfont(self, rf, st):
-        key = (getattr(rf, "key", ""), st.key)
+    def _qfont(self, rf, st, scale=1.0):
+        key = (getattr(rf, "key", ""), st.key, round(scale, 3))
         if key not in self._font_cache:
             from ui.overlay_fonts import qfont_for_style
-            self._font_cache[key] = qfont_for_style(rf, st)
+            self._font_cache[key] = qfont_for_style(rf, st, zoom=scale)
         return self._font_cache[key]
 
     def paint(self, painter, option, widget):
@@ -47,7 +47,8 @@ class BoxEditorItem(QGraphicsItem):
         buf = sess.buffer
         oracle = sess.oracle
         adv = oracle.adv_fn()
-        lh = buf.line_height
+        scale = buf.fit_scale if buf.fit_scale > 0 else 1.0
+        lh = buf.line_height * scale
 
         bb = buf.bbox()
         painter.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 160),
@@ -81,7 +82,7 @@ class BoxEditorItem(QGraphicsItem):
         if sess.preedit:
             st = buf.style_at(sess.cursor)
             rf = oracle.char_font(st, "预")
-            f = self._qfont(rf, st)
+            f = self._qfont(rf, st, scale)
             painter.setFont(f)
             painter.setPen(QPen(QColor(ACCENT)))
             x, bl = buf.cursor_pos(sess.cursor, adv)

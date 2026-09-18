@@ -244,6 +244,26 @@ def test_gui_smoke(window):
                        for im in m1c.images)
             check("图片撤销（字节级）", back)
 
+    win.status_hint("溢出策略已切换")
+    check("提示条可见", win.canvas.hint_text() == "溢出策略已切换")
+    win.set_overflow_strategy("keep")
+    check("溢出策略 keep", win.overflow_strategy() == "keep")
+    win.set_overflow_strategy("shrink")
+    check("溢出策略 shrink", win.overflow_strategy() == "shrink")
+    win.set_page(0)
+    app.processEvents()
+    model = win.page_model()
+    blk = next((b for b in model.blocks if "HT-2026-0917" in b.text()), None)
+    check("样式测试定位文本框", blk is not None)
+    if blk:
+        win.start_session(blk)
+        win.apply_session_style(20.0, (0.1, 0.2, 0.3))
+        st = win.current_style()
+        check("会话应用字号", st is not None and abs(st.size - 20.0) < 0.05)
+        check("应用样式后缓冲已改", win.session.buffer.changed)
+        win.cancel_session()
+        check("样式取消恢复", win.session is None)
+
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     try:

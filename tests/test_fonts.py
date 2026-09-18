@@ -244,3 +244,17 @@ def test_faux_bold_insert_writes_render_mode():
     stream = b"".join(doc.xref_stream(x) for x in page.get_contents())
     assert b"Tr" in stream
     doc.close()
+
+
+def test_faux_italic_insert_writes_text():
+    from core.models import TextStyle
+    from core.fonts import ResolvedFont
+    doc = fitz.open()
+    page = doc.new_page()
+    st = TextStyle(font_name="Helvetica", size=16, flags=2)
+    rf = ResolvedFont("helv", fitz.Font("helv"), True, "复用原内置字体资源")
+    executor.insert_runs(page, [("Slanted", st, 72, 140, rf)], FontResolver(doc))
+    assert "Slanted" in page.get_text()
+    stream = b"".join(doc.xref_stream(x) for x in page.get_contents())
+    assert b"cm" in stream
+    doc.close()

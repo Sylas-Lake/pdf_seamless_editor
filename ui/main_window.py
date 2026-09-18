@@ -151,6 +151,8 @@ class MainWindow(QMainWindow):
         head_lay.addStretch(1)
         props_lay.addWidget(head)
         self.panel = PropertyPanel(self)
+        self.panel.apply_style.connect(self.apply_session_style)
+        self.panel.overflow_changed.connect(self.set_overflow_strategy)
         props_lay.addWidget(self.panel, 1)
         self.pane_props.setMinimumWidth(240)
 
@@ -418,6 +420,7 @@ class MainWindow(QMainWindow):
         before = capture_page_state(self.doc, page)
         buffer = BoxBuffer(block)
         oracle = FontOracle.from_block(self.resolver, page, block)
+        buffer.overflow = self._overflow_strategy
         buffer.set_measure(oracle.adv_fn())
         sess = EditSession(block, self.page_no, buffer, before, oracle)
         self.session = sess
@@ -521,6 +524,18 @@ class MainWindow(QMainWindow):
             if len(buffer.visual) > getattr(buffer, "_orig_visual_count", 0):
                 if "内容重排（自动换行）" not in fid.reasons:
                     fid.reasons.append("内容重排（自动换行）")
+                level = worse(level, "yellow")
+            if abs(getattr(buffer, "fit_scale", 1.0) - 1.0) > 0.01:
+                if "字号缩小以适应文本框" not in fid.reasons:
+                    fid.reasons.append("字号缩小以适应文本框")
+                level = worse(level, "yellow")
+            if getattr(buffer, "_style_dirty", False):
+                if "已修改字号或颜色" not in fid.reasons:
+                    fid.reasons.append("已修改字号或颜色")
+                level = worse(level, "yellow")
+            if getattr(buffer, "overflowed", False):
+                if "内容超出文本框" not in fid.reasons:
+                    fid.reasons.append("内容超出文本框")
                 level = worse(level, "yellow")
             fid.level = worse(fid.level, level)
         for r in getattr(cmd, "edit_rects", []) or []:
@@ -726,6 +741,49 @@ class MainWindow(QMainWindow):
             return self.selected_block.dominant_style()
         return None
 
+    def overflow_strategy(self) -> str:
+        return self._overflow_strategy
+
+    def set_overflow_strategy(self, name: str):
+        self._overflow_strategy = name or "shrink"
+        if self.session is not None:
+            self.session.buffer.overflow = self._overflow_strategy
+            self.session.buffer.layout()
+            if self._overflow_strategy == "keep" and self.session.buffer.overflowed:
+                self.status_hint("内容超出文本框（保持字号）")
+            self._sync_session_preview()
+
+    def apply_session_style(self, size, color):
+        if not self._editable():
+            return
+        if self.session is not None:
+            self.session.buffer.apply_style(size, color, self.session.selection)
+            self._sync_session_preview()
+            self.status_hint("已应用样式")
+            return
+        block = self.selected_block
+        if block is None:
+            self.status_hint("请先选中文本框或进入编辑")
+            return
+        page = self.current_page()
+        before = capture_page_state(self.doc, page)
+        buffer = BoxBuffer(block)
+        oracle = FontOracle.from_block(self.resolver, page, block)
+        buffer.overflow = self._overflow_strategy
+        buffer.set_measure(oracle.adv_fn())
+        buffer.apply_style(size, color, None)
+        executor.remove_text_region(page, line_redact_rects(block))
+        runs = buffer.commit_runs(oracle)
+        executor.insert_runs(page, runs, self.resolver)
+        after = capture_page_state(self.doc, page)
+        cmd = PageStateCommand("应用样式", self.page_no, before, after)
+        cmd.edit_rects = line_redact_rects(block) + [buffer.bbox()]
+        self._register_cmd(cmd, buffer, runs)
+
+    def status_hint(self, msg):
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.set_hint(msg or "")
+
     # ================================================== 剪贴板
     def copy(self):
         sess = self.session
@@ -768,6 +826,7 @@ class MainWindow(QMainWindow):
         before = capture_page_state(self.doc, page)
         buffer = BoxBuffer(block)
         oracle = FontOracle.from_block(self.resolver, page, block)
+        buffer.overflow = self._overflow_strategy
         buffer.set_measure(oracle.adv_fn())
         if abs(dx) > 0.5 or abs(dy) > 0.5:
             buffer.translate(dx, dy)
@@ -1019,9 +1078,6 @@ class MainWindow(QMainWindow):
         self.set_zoom(z)
 
     def _on_hover(self, x, y):
-        return
-
-    def status_hint(self, msg):
         return
 
     def _update_panels(self):

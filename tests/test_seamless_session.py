@@ -271,3 +271,90 @@ def test_ensure_page_font_survives_restore():
     executor.insert_runs(page, runs, resolver)
     assert "X" in page.get_text()
     doc.close()
+
+
+def _latin_block(text, size=12.0, tracking=0.0, origin=(50.0, 100.0)):
+    from core.models import GlyphNode, TextBlock, TextLine, TextStyle
+    st = TextStyle(font_name="helv", size=size)
+    glyphs = []
+    x = origin[0]
+    w = size * 0.5
+    y = origin[1]
+    for ch in text:
+        glyphs.append(GlyphNode(ch, (x, y - size, x + w, y + 2), (x, y), st))
+        x += w + tracking
+    line = TextLine(0, (origin[0], y - size, x, y + 2), y, glyphs)
+    return TextBlock(0, (origin[0], y - size, x, y + 2), [line])
+
+
+class _HelvOracle:
+    def char_font(self, st, ch):
+        from types import SimpleNamespace
+        return SimpleNamespace(key="helv", is_original=True, source="内置")
+
+    def advance(self, st, ch):
+        o = ord(ch)
+        if 0x2E80 <= o <= 0x9FFF or 0xFF00 <= o <= 0xFFEF:
+            return st.size
+        return st.size * 0.5
+
+    def adv_fn(self):
+        return lambda ch, st: self.advance(st, ch)
+
+
+def test_overflow_shrink_scales_commit_size():
+    blk = _latin_block("HELLOHELLO", size=12.0)
+    buf = BoxBuffer(blk)
+    nat = buf.width
+    buf.set_width(nat * 0.55)
+    assert buf.overflow == "shrink"
+    assert buf.fit_scale < 0.9
+    assert buf.fit_scale >= 0.45
+    oracle = _HelvOracle()
+    runs = buf.commit_runs(oracle)
+    assert runs
+    assert all(abs(st.size - 12.0 * buf.fit_scale) < 0.05
+               for _t, st, _x, _b, _rf in runs)
+    assert not buf.overflowed
+
+
+def test_overflow_keep_flags_overflowed():
+    blk = _latin_block("HELLOHELLO", size=12.0)
+    buf = BoxBuffer(blk)
+    nat = buf.width
+    buf.overflow = "keep"
+    buf.set_width(nat * 0.4)
+    assert abs(buf.fit_scale - 1.0) < 1e-6
+    assert buf.overflowed
+    oracle = _HelvOracle()
+    runs = buf.commit_runs(oracle)
+    assert all(abs(st.size - 12.0) < 0.05 for _t, st, _x, _b, _rf in runs)
+
+
+def test_apply_style_marks_changed_and_size():
+    blk = _latin_block("ABC", size=11.0)
+    buf = BoxBuffer(blk)
+    assert not buf.changed
+    buf.apply_style(size=18.0, color=(1.0, 0.0, 0.0))
+    assert buf.changed
+    st = buf.style_at((0, 1))
+    assert abs(st.size - 18.0) < 1e-6
+    assert st.color == (1.0, 0.0, 0.0)
+
+
+def test_insert_picks_up_tracking():
+    track = 1.4
+    blk = _latin_block("AB", size=12.0, tracking=track)
+    buf = BoxBuffer(blk)
+    oracle = _HelvOracle()
+    buf.set_measure(oracle.adv_fn())
+    assert abs(buf.tracking - track) < 0.08
+    buf.insert((0, 2), "X")
+    runs = buf.commit_runs(oracle)
+    xs = [x for _t, _s, x, _b, _rf in runs]
+    assert len(xs) >= 3
+    gap_ab = xs[1] - xs[0]
+    gap_bx = xs[2] - xs[1]
+    adv = oracle.advance(buf.hard_lines[0][0][1], "A")
+    assert abs(gap_ab - (adv + track)) < 0.12
+    assert abs(gap_bx - (adv + track)) < 0.12
