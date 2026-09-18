@@ -9,12 +9,63 @@ from PIL import Image
 from core.compat import fitz
 from core import executor
 from core.extractor import extract_page, line_redact_rects
-from core.fonts import (FontOracle, FontResolver, font_identity_key,
-                        fonts_same_face, system_font_candidates)
+from core.fonts import (FontOracle, FontResolver, font_display_label,
+                        font_identity_key, fonts_same_face, repair_font_name,
+                        system_font_candidates, unescape_pdf_name)
 from core.sample import create_sample_pdf
 from core.snapshot import capture_page_state
 from core.textbox import BoxBuffer
 import core.fonts as fonts_mod
+
+
+def test_repair_font_name_recovers_gbk_mojibake():
+    raw = "微软雅黑".encode("gbk").decode("latin-1")
+    assert repair_font_name(raw) == "微软雅黑"
+    assert unescape_pdf_name("Sim#53un") == "SimSun"
+
+
+def test_font_display_label_maps_common_faces():
+    assert font_display_label("ABCDEF+SimSun") == "宋体"
+    assert "微软雅黑" in font_display_label("MicrosoftYaHei")
+    assert "粗体" in font_display_label("Arial-BoldMT")
+    assert "斜体" in font_display_label("Arial Italic")
+    assert font_display_label("SimHei Regular") == "黑体"
+
+
+def test_textstyle_reads_bold_italic_from_name_and_render_mode():
+    from core.models import TextStyle
+    assert TextStyle(font_name="Arial-BoldMT").is_bold
+    assert TextStyle(font_name="Arial", flags=16).is_bold
+    assert TextStyle(font_name="Helvetica", render_mode=2).is_bold
+    assert TextStyle(font_name="Arial-ItalicMT").is_italic
+    assert not TextStyle(font_name="SimSun").is_bold
+    assert not TextStyle(font_name="SimHei Regular").is_italic
+
+
+def test_extract_reads_embedded_family_and_weight():
+    arialbd = r"C:\Windows\Fonts\arialbd.ttf"
+    msyhbd = r"C:\Windows\Fonts\msyhbd.ttc"
+    if not os.path.isfile(arialbd):
+        import pytest
+        pytest.skip("no Arial Bold")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_font(fontname="FB", fontfile=arialbd)
+    page.insert_text((72, 120), "BoldTitle", fontname="FB", fontsize=16)
+    if os.path.isfile(msyhbd):
+        page.insert_font(fontname="FY", fontfile=msyhbd)
+        page.insert_text((72, 160), "粗体合同", fontname="FY", fontsize=16)
+    model = extract_page(page, 0)
+    latin = next(b for b in model.blocks if "BoldTitle" in b.text())
+    st = latin.dominant_style()
+    assert st.is_bold, (st.font_name, st.display_name, st.flags)
+    assert "Arial" in (st.display_name or st.font_name)
+    if os.path.isfile(msyhbd):
+        cjk = next(b for b in model.blocks if "粗体" in b.text())
+        cs = cjk.dominant_style()
+        assert cs.is_bold, (cs.font_name, cs.display_name, cs.flags)
+        assert "微软雅黑" in cs.display_name
+    doc.close()
 
 
 def test_font_identity_key_aligns_span_and_basefont():

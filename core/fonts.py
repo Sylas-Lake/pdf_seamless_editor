@@ -10,14 +10,17 @@ get_fonts 却是 Microsoft YaHei Regular / Arial Regular。对不上就会整框
 """
 import os
 import re
+import unicodedata
 
 from .compat import fitz
-
-from .extractor import _is_mark
 
 BUILTIN_KEYS = {"helv", "tiro", "cour", "symb", "zadb",
                 "china-t", "china-s", "china-ts", "china-ss",
                 "japan", "japan-s", "korea", "korea-s"}
+
+
+def _is_mark(ch: str) -> bool:
+    return unicodedata.combining(ch) != 0 or ch in ("\u200d", "\u200b", "\ufe0f")
 
 
 def strip_subset_prefix(name: str) -> str:
@@ -25,6 +28,38 @@ def strip_subset_prefix(name: str) -> str:
     if not name:
         return ""
     return name.split("+", 1)[-1] if "+" in name else name
+
+
+def unescape_pdf_name(name: str) -> str:
+    """还原 PDF 名里的 #XX 转义。"""
+    if not name:
+        return ""
+    return re.sub(r"#([0-9A-Fa-f]{2})",
+                  lambda m: chr(int(m.group(1), 16)), name)
+
+
+def repair_font_name(name: str) -> str:
+    """修复错误解码的字体名（GBK/UTF-8 被当成 Latin-1 等）。"""
+    s = unescape_pdf_name(name or "").strip()
+    if not s:
+        return ""
+    if any("\u4e00" <= c <= "\u9fff" for c in s):
+        return s
+    high = [c for c in s if ord(c) >= 0x80]
+    if not high:
+        return s
+    try:
+        raw = s.encode("latin-1")
+    except UnicodeEncodeError:
+        return s
+    for enc in ("utf-8", "gb18030", "gbk", "big5"):
+        try:
+            got = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        if got != s and any("\u4e00" <= c <= "\u9fff" for c in got):
+            return got.strip()
+    return s
 
 
 # PostScript/TrueType 后缀：ArialMT、TimesNewRomanPSMT、Arial-BoldMT
@@ -71,6 +106,132 @@ def _face_style(name: str, flags: int = 0) -> tuple[bool, bool, bool]:
     italic = bool(flags & 2) or ("italic" in n) or ("oblique" in n)
     light = ("light" in n) and ("ultralight" in n or "light" in n) and "bold" not in n
     return bold, italic, light
+
+
+_FAMILY_LABELS = {
+    "simsun": "宋体",
+    "nsimsun": "新宋体",
+    "simhei": "黑体",
+    "heiti": "黑体",
+    "microsoftyahei": "微软雅黑",
+    "microsoftyahehui": "微软雅黑 UI",
+    "kaiti": "楷体",
+    "simkai": "楷体",
+    "fangsong": "仿宋",
+    "simfang": "仿宋",
+    "dengxian": "等线",
+    "sourcehansans": "思源黑体",
+    "sourcehansanssc": "思源黑体",
+    "sourcehanserif": "思源宋体",
+    "sourcehanserifsc": "思源宋体",
+    "notosanscjk": "Noto Sans CJK",
+    "notosanssc": "Noto Sans SC",
+    "notoserifcjk": "Noto Serif CJK",
+    "arial": "Arial",
+    "timesnewroman": "Times New Roman",
+    "helvetica": "Helvetica",
+    "calibri": "Calibri",
+    "stsong": "华文宋体",
+    "stheiti": "华文黑体",
+    "stkaiti": "华文楷体",
+    "stfangsong": "华文仿宋",
+    "mingliu": "细明体",
+    "pmingliu": "新细明体",
+    "microsoftjhenghei": "微软正黑体",
+}
+
+
+def font_display_label(name: str) -> str:
+    """给属性栏看的字体名：修复乱码、映射常用族名、标出粗/斜。"""
+    s = repair_font_name(name)
+    if not s:
+        return ""
+    ident = font_identity_key(s)
+    family = _FAMILY_LABELS.get(ident)
+    if not family:
+        family = re.sub(r"(?i)[\s\-_]?(regular|normal)$", "", s).strip() or s
+        family = re.sub(r"\s+", " ", family)
+    bold, italic, light = _face_style(s, 0)
+    if bold and italic:
+        return f"{family} · 粗斜体"
+    if bold:
+        return f"{family} · 粗体"
+    if italic:
+        return f"{family} · 斜体"
+    if light:
+        return f"{family} · 细体"
+    return family
+
+
+def _font_buffer_from_xref(doc, xref):
+    try:
+        ef = doc.extract_font(xref)
+        if isinstance(ef, dict):
+            return ef.get("image") or ef.get("content")
+        if isinstance(ef, (tuple, list)) and len(ef) >= 4:
+            return ef[3]
+    except Exception:
+        return None
+    return None
+
+
+def page_font_catalog(page) -> dict:
+    """span/资源字体名 → {display, flags}。优先读嵌入 TTF 的真实名称与粗斜体。"""
+    cat = {}
+    doc = getattr(page, "parent", None)
+    try:
+        fonts = page.get_fonts(full=True)
+    except Exception:
+        return cat
+    for info in fonts:
+        xref = info[0] if info else 0
+        basefont = info[3] if len(info) > 3 else ""
+        resname = info[4] if len(info) > 4 else ""
+        extra = 0
+        true_name = ""
+        buf = _font_buffer_from_xref(doc, xref) if doc is not None and xref else None
+        if buf:
+            try:
+                f = fitz.Font(fontbuffer=buf)
+                true_name = getattr(f, "name", "") or ""
+                if getattr(f, "is_bold", False):
+                    extra |= 16
+                if getattr(f, "is_italic", False):
+                    extra |= 2
+                flags = getattr(f, "flags", None)
+                if isinstance(flags, dict):
+                    if flags.get("bold") or flags.get("fake-bold"):
+                        extra |= 16
+                    if flags.get("italic") or flags.get("fake-italic"):
+                        extra |= 2
+            except Exception:
+                pass
+        raw = true_name or basefont or resname
+        nb, ni, _nl = _face_style(raw, extra)
+        if nb:
+            extra |= 16
+        if ni:
+            extra |= 2
+        rec = {"display": font_display_label(raw), "flags": extra,
+               "basefont": basefont}
+        for key in (basefont, resname, strip_subset_prefix(basefont),
+                    strip_subset_prefix(resname), true_name):
+            if key and key not in cat:
+                cat[key] = rec
+    return cat
+
+
+def lookup_font_info(cat: dict, pdf_name: str) -> dict:
+    """按 PDF span 字体名取目录记录。"""
+    if not pdf_name:
+        return {}
+    rec = cat.get(pdf_name) or cat.get(strip_subset_prefix(pdf_name))
+    if rec:
+        return rec
+    for key, rec in cat.items():
+        if fonts_same_face(key, pdf_name):
+            return rec
+    return {}
 
 
 def _has_glyph(font, ch: str) -> bool:
@@ -164,6 +325,8 @@ _ALIAS = {
     "仿宋": "simfang.ttf", "simfang": "simfang.ttf", "dengxian": "deng.ttf",
     "等线": "deng.ttf", "deng": "deng.ttf", "微软雅黑 light": "msyhl.ttc",
     "arial": "arial.ttf", "calibri": "calibri.ttf", "times new roman": "times.ttf",
+    "华文宋体": "STSONG.TTF", "华文黑体": "STHEITI.TTF", "华文楷体": "STKAITI.TTF",
+    "华文仿宋": "STFANGSO.TTF", "微软雅黑 bold": "msyhbd.ttc",
 }
 
 # ident → (regular, bold, italic, bolditalic, light)
@@ -175,6 +338,8 @@ _FACE_FILES = {
     "simsun": ("simsun.ttc", None, None, None, None),
     "nsimsun": ("simsun.ttc", None, None, None, None),
     "simhei": ("simhei.ttf", None, None, None, None),
+    "simkai": ("simkai.ttf", None, None, None, None),
+    "simfang": ("simfang.ttf", None, None, None, None),
 }
 
 
@@ -413,30 +578,31 @@ class FontResolver:
         return [f for _, f in scored]
 
     # -- 解析 --
-    def resolve(self, page, style, text: str) -> ResolvedFont:
+    def resolve(self, page, style, text: str, *, allow_original=True) -> ResolvedFont:
         base = strip_subset_prefix(style.font_name or "")
 
         # 策略 A：复用原始嵌入字体（子集覆盖检查）
-        for finfo in self._page_font_hits(page, style):
-            resname = finfo[4] if len(finfo) > 4 else ""
-            buf, f = self._extracted(finfo[0])
-            if buf:
-                if f is not None and covers(f, text):
-                    key = self._register_buffer(buf)
-                    return ResolvedFont(key, f, True, "复用原始嵌入字体")
-                if not text:
-                    # 身份解析：CID 子集可能没有 Unicode cmap，covers 会假阴性
-                    key = self._register_buffer(buf)
-                    return ResolvedFont(key, f, True, "复用原始嵌入字体",
-                                        coverage_ok=f is not None)
-            if resname in BUILTIN_KEYS:
-                bf = self._load_buffer(None, resname)
-                if bf is not None and covers(bf, text):
-                    return ResolvedFont(resname, bf, True,
-                                        "复用原内置字体资源")
-                if not text and bf is not None:
-                    return ResolvedFont(resname, bf, True,
-                                        "复用原内置字体资源")
+        if allow_original:
+            for finfo in self._page_font_hits(page, style):
+                resname = finfo[4] if len(finfo) > 4 else ""
+                buf, f = self._extracted(finfo[0])
+                if buf:
+                    if f is not None and covers(f, text):
+                        key = self._register_buffer(buf)
+                        return ResolvedFont(key, f, True, "复用原始嵌入字体")
+                    if not text:
+                        # 身份解析：CID 子集可能没有 Unicode cmap，covers 会假阴性
+                        key = self._register_buffer(buf)
+                        return ResolvedFont(key, f, True, "复用原始嵌入字体",
+                                            coverage_ok=f is not None)
+                if resname in BUILTIN_KEYS:
+                    bf = self._load_buffer(None, resname)
+                    if bf is not None and covers(bf, text):
+                        return ResolvedFont(resname, bf, True,
+                                            "复用原内置字体资源")
+                    if not text and bf is not None:
+                        return ResolvedFont(resname, bf, True,
+                                            "复用原内置字体资源")
 
         # 策略 A'：系统同名完整字体（扩展原字体）
         if base:
@@ -510,17 +676,23 @@ class FontOracle:
     时 has_glyph 为假，不能再强行用原字体，否则会落下 .notdef 方块。
     """
 
-    def __init__(self, resolver, page, original_chars=None):
+    def __init__(self, resolver, page, original_chars=None, blank_chars=None):
         self.resolver = resolver
         self.page = page
         self._style_font = {}    # style.key -> ResolvedFont（原始字体）
         self._char_cache = {}    # (style_key, ch) -> (rf, adv)
         self._adv_cache = {}     # (rf_key, ch, size) -> float
         self._orig_chars = original_chars or set()
+        self._blank_chars = blank_chars or set()
 
     @classmethod
     def from_block(cls, resolver, page, block):
-        return cls(resolver, page, original_chars_from_block(block))
+        blank = set()
+        for ln in getattr(block, "lines", []) or []:
+            for g in getattr(ln, "glyphs", []) or []:
+                if g.style is not None and g.char and getattr(g, "missing_ink", False):
+                    blank.add((g.style.key, g.char))
+        return cls(resolver, page, original_chars_from_block(block), blank)
 
     def original_font(self, style) -> ResolvedFont:
         """该样式在页面上的原始字体。
@@ -542,7 +714,10 @@ class FontOracle:
         if k in self._char_cache:
             return self._char_cache[k][0]
         rf = self.original_font(style)
-        if not font_can_insert(rf, ch):
+        if k in self._blank_chars:
+            # cmap 有字但轮廓是空的：has_glyph 为真，必须跳过原子集
+            rf = self.resolver.resolve(self.page, style, ch, allow_original=False)
+        elif not font_can_insert(rf, ch):
             rf = self.resolver.resolve(self.page, style, ch)
         self._char_cache[k] = (rf, None)
         return rf

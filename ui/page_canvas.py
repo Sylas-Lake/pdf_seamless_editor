@@ -6,12 +6,14 @@
 - Ctrl+滚轮缩放；Shift+滚轮横向平移；滚轮在页边翻页
 """
 import math
+import os
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter
+from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF, QEvent
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QGuiApplication,
+                           QPainter)
 from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsPixmapItem,
-                               QGraphicsScene, QGraphicsView, QMenu)
+                               QGraphicsScene, QGraphicsView, QLabel, QMenu)
 
 from core.geom import qrect_args, resize_rect
 from ui.box_editor import BoxEditorItem
@@ -26,6 +28,23 @@ def to_qrect(xyxy) -> QRectF:
 
 def qrect_xyxy(r: QRectF) -> tuple:
     return (r.left(), r.top(), r.right(), r.bottom())
+
+
+def local_pdf_paths(mime) -> list[str]:
+    """从拖放 MIME 取出本地 PDF 路径。"""
+    if mime is None or not mime.hasUrls():
+        return []
+    out = []
+    seen = set()
+    for url in mime.urls():
+        path = url.toLocalFile()
+        if not path:
+            continue
+        path = os.path.normpath(path)
+        if path.lower().endswith(".pdf") and os.path.isfile(path) and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
 
 
 class PageCanvas(QGraphicsView):
@@ -48,6 +67,9 @@ class PageCanvas(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.setInputMethodHints(Qt.InputMethodHint.ImhNone)
+        self.viewport().installEventFilter(self)
         # 事件全部由视图处理，避免 pixmap 吞掉 Windows 的 DblClick
         self.setInteractive(False)
         self.setMouseTracking(True)
@@ -55,6 +77,7 @@ class PageCanvas(QGraphicsView):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setBackgroundBrush(QBrush(QColor("#4B4F55")))
         self._scene.setBackgroundBrush(QBrush(QColor("#4B4F55")))
+        self.setAcceptDrops(True)
 
         self.pixmap_item = None
         self.box_editor = BoxEditorItem(self)
@@ -66,6 +89,14 @@ class PageCanvas(QGraphicsView):
         self.hint_item.setPos(24, 12)
         self.hint_item.setZValue(5)
         self.hint_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        self._empty_label = QLabel("点击此处打开 PDF\n或将文件拖到这里", self.viewport())
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._empty_label.setStyleSheet(
+            "QLabel { color: #D0D4DA; font-size: 16px; background: transparent; }"
+        )
+        self._empty_label.hide()
 
         # 交互状态
         self._selecting = False
@@ -88,12 +119,30 @@ class PageCanvas(QGraphicsView):
         if pixmap is None:
             self.pixmap_item = None
             self._scene.setSceneRect(QRectF(0, 0, page_w, page_h))
+            self.set_empty_prompt(True)
             return
         self.pixmap_item = QGraphicsPixmapItem(pixmap)
         self.pixmap_item.setZValue(-10)
         self.pixmap_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._scene.addItem(self.pixmap_item)
         self._scene.setSceneRect(QRectF(0, 0, page_w, page_h))
+        self.set_empty_prompt(False)
+
+    def set_empty_prompt(self, on: bool):
+        self._empty_label.setVisible(bool(on))
+        self._layout_empty_prompt()
+
+    def empty_prompt_visible(self) -> bool:
+        return self._empty_label.isVisible()
+
+    def _layout_empty_prompt(self):
+        if not self._empty_label.isVisible():
+            return
+        self._empty_label.setGeometry(self.viewport().rect())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._layout_empty_prompt()
 
     def apply_zoom(self):
         self.resetTransform()
@@ -178,6 +227,43 @@ class PageCanvas(QGraphicsView):
         self._refresh_handles()
 
     # ------------------------------------------------ 输入法
+    def _grab_focus(self):
+        # 焦点必须留在视图上：绑到 viewport 时 Windows IME 收不到 inputMethodEvent
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def prepare_ime(self):
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+        self._grab_focus()
+        im = QGuiApplication.inputMethod()
+        if im is not None:
+            im.update(Qt.InputMethodQuery.ImQueryAll)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.viewport():
+            et = ev.type()
+            if et == QEvent.Type.InputMethod:
+                self.inputMethodEvent(ev)
+                return True
+            if et == QEvent.Type.InputMethodQuery:
+                queries = ev.queries()
+                for q in (
+                    Qt.InputMethodQuery.ImEnabled,
+                    Qt.InputMethodQuery.ImCursorRectangle,
+                    Qt.InputMethodQuery.ImFont,
+                    Qt.InputMethodQuery.ImCursorPosition,
+                    Qt.InputMethodQuery.ImAnchorPosition,
+                    Qt.InputMethodQuery.ImSurroundingText,
+                    Qt.InputMethodQuery.ImCurrentSelection,
+                    Qt.InputMethodQuery.ImHints,
+                ):
+                    if queries & q:
+                        ev.setValue(q, self.inputMethodQuery(q))
+                return True
+            if et == QEvent.Type.Resize:
+                self._layout_empty_prompt()
+        return super().eventFilter(obj, ev)
+
     def inputMethodEvent(self, e):
         c = self.controller
         if self.session_active():
@@ -191,25 +277,39 @@ class PageCanvas(QGraphicsView):
 
     def inputMethodQuery(self, q):
         if q == Qt.InputMethodQuery.ImEnabled:
-            return self.session_active()
+            return True
+        if q == Qt.InputMethodQuery.ImHints:
+            return Qt.InputMethodHint.ImhNone
+        if q == Qt.InputMethodQuery.ImFont:
+            return QFont("Microsoft YaHei", 12)
+        c = self.controller
         if q == Qt.InputMethodQuery.ImCursorRectangle:
-            c = self.controller
             if self.session_active():
                 x, bl = c.session_cursor_pos()
                 r = QRectF(x, bl - c.session.buffer.line_height, 2,
                            c.session.buffer.line_height)
                 return self.mapFromScene(r).boundingRect()
             return QRectF()
+        if q in (Qt.InputMethodQuery.ImCursorPosition,
+                 Qt.InputMethodQuery.ImAnchorPosition):
+            if self.session_active():
+                return int(c.session.cursor[1])
+            return 0
+        if q == Qt.InputMethodQuery.ImSurroundingText:
+            if self.session_active():
+                h, _o = c.session.cursor
+                line = c.session.buffer.hard_lines[h]
+                return "".join(ch for ch, _st in line)
+            return ""
+        if q == Qt.InputMethodQuery.ImCurrentSelection:
+            if self.session_active() and c.session.selection:
+                return c.session.buffer.selection_text(*c.session.selection)
+            return ""
         return super().inputMethodQuery(q)
 
-    # ------------------------------------------------ 鼠标
     def _pdf_pos(self, e):
         p = self.mapToScene(e.position().toPoint())
         return p.x(), p.y()
-
-    def _grab_focus(self):
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        self.viewport().setFocus(Qt.FocusReason.MouseFocusReason)
 
     def _try_begin_edit(self, x, y):
         """双击文本框进入编辑。成功返回 True。"""
@@ -221,7 +321,7 @@ class PageCanvas(QGraphicsView):
         if c.session is None:
             return False
         c.session_click(x, y)
-        self._grab_focus()
+        self.prepare_ime()
         self.box_editor._blink_on = True
         self.box_editor.update()
         return True
@@ -231,6 +331,11 @@ class PageCanvas(QGraphicsView):
         if e.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(e)
             return
+        c = self.controller
+        if c.doc is None:
+            c.open_file()
+            e.accept()
+            return
         now = time.monotonic() * 1000
         self._click_count = (self._click_count + 1
                              if now - self._last_click_ms < 450 else 1)
@@ -238,7 +343,6 @@ class PageCanvas(QGraphicsView):
 
         sp = self.mapToScene(e.position().toPoint())
         x, y = sp.x(), sp.y()
-        c = self.controller
         shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
         # 会话内：定位缓冲光标 / 选词 / 选行
@@ -344,6 +448,8 @@ class PageCanvas(QGraphicsView):
             self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         elif self.model is not None:
             self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        elif c.doc is None:
+            self.viewport().setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         else:
             self.viewport().unsetCursor()
 
@@ -433,6 +539,23 @@ class PageCanvas(QGraphicsView):
         if self.session_active():
             self.box_editor._blink_on = True
             self.box_editor.update()
+
+    def dragEnterEvent(self, e):
+        if local_pdf_paths(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        self.dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        paths = local_pdf_paths(e.mimeData())
+        if not paths:
+            e.ignore()
+            return
+        self.controller.open_file(paths[0])
+        e.acceptProposedAction()
 
     # ------------------------------------------------ 拖拽（图片 / 文本框）
     def _start_drag(self, hit, sp):

@@ -14,6 +14,7 @@ from .types import PdfRect, Point, Rgb
 class TextStyle:
     """文本样式（继承自原 PDF span，用于样式继承）。"""
     font_name: str = ""
+    display_name: str = ""
     size: float = 11.0
     color: Rgb = (0.0, 0.0, 0.0)
     flags: int = 0
@@ -30,16 +31,22 @@ class TextStyle:
 
     @property
     def is_bold(self) -> bool:
-        return bool(self.flags & 16)
+        if self.flags & 16 or self.render_mode == 2:
+            return True
+        n = f"{self.font_name} {self.display_name}".lower()
+        return any(w in n for w in ("bold", "black", "heavy", "semibold", "粗体"))
 
     @property
     def is_italic(self) -> bool:
-        return bool(self.flags & 2)
+        if self.flags & 2:
+            return True
+        n = f"{self.font_name} {self.display_name}".lower()
+        return any(w in n for w in ("italic", "oblique", "斜体"))
 
     @property
     def name_says_bold(self) -> bool:
-        n = (self.font_name or "").lower()
-        return any(w in n for w in ("bold", "black", "heavy", "semibold"))
+        n = f"{self.font_name} {self.display_name}".lower()
+        return any(w in n for w in ("bold", "black", "heavy", "semibold", "粗体"))
 
 
 @dataclass
@@ -49,6 +56,7 @@ class GlyphNode:
     bbox: PdfRect
     origin: Point
     style: Optional[TextStyle] = None
+    missing_ink: bool = False
 
 
 @dataclass

@@ -2,6 +2,7 @@
 import math
 import unicodedata
 
+from .fonts import font_display_label, lookup_font_info, page_font_catalog
 from .models import (GlyphNode, ImageObject, PageModel, TextBlock,
                      TextLine, TextStyle)
 from .types import PdfRect
@@ -60,6 +61,8 @@ def extract_page(page, page_index: int) -> PageModel:
     except Exception:
         raw = {"blocks": []}
 
+    catalog = page_font_catalog(page)
+
     for block in raw.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -69,9 +72,13 @@ def extract_page(page, page_index: int) -> PageModel:
             for span in ln.get("spans", []):
                 flags = int(span.get("flags", 0) or 0)
                 font_name = span.get("font", "") or ""
+                info = lookup_font_info(catalog, font_name)
+                flags |= int(info.get("flags", 0) or 0)
+                display = info.get("display") or font_display_label(font_name)
                 size = float(span.get("size", 11.0) or 11.0)
                 style = TextStyle(
                     font_name=font_name,
+                    display_name=display,
                     size=size,
                     color=_int_to_rgb(span.get("color", 0) or 0),
                     flags=flags,

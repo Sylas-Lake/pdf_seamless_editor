@@ -1,6 +1,6 @@
 """属性面板：样式继承展示、选区样式修改、溢出策略、保真状态。"""
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QColorDialog, QComboBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QLabel,
                                QListWidget, QPushButton, QVBoxLayout,
@@ -26,6 +26,8 @@ class PropertyPanel(QWidget):
         gb_style = QGroupBox("样式继承（光标处）")
         form = QFormLayout(gb_style)
         self.ed_font = QLabel("—")
+        self.ed_font.setWordWrap(True)
+        self.ed_font.setFont(QFont("Microsoft YaHei", 9))
         self.ed_font.setTextInteractionFlags(Qt.TextInteractionFlags.TextSelectableByMouse)
         self.sp_size = QDoubleSpinBox()
         self.sp_size.setRange(3.0, 96.0)
@@ -92,7 +94,7 @@ class PropertyPanel(QWidget):
         if style is None:
             self.ed_font.setText("—")
             return
-        self.ed_font.setText(style.font_name or "（默认）")
+        self.ed_font.setText(style.display_name or style.font_name or "（默认）")
         self.sp_size.setValue(round(style.size, 1))
         self._color = style.color
         self._update_color_btn()

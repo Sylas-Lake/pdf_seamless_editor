@@ -122,6 +122,10 @@ def test_gui_smoke(window):
 
         win.start_session(blk)
         check("会话建立", win.session is not None)
+        check("输入法已启用",
+              bool(win.canvas.inputMethodQuery(Qt.InputMethodQuery.ImEnabled)))
+        surr = win.canvas.inputMethodQuery(Qt.InputMethodQuery.ImSurroundingText)
+        check("输入法周围文本", isinstance(surr, str) and len(surr) > 0, str(surr)[:40])
         from core.snapshot import page_state_equal
         from core import verifier
         import numpy as np
@@ -279,3 +283,75 @@ def test_gui_smoke(window):
             os.remove(tmp)
         except OSError:
             pass
+
+
+def _one_page_pdf(text: str) -> str:
+    from core.compat import fitz
+
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 120), text, fontname="china-s", fontsize=16)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def test_empty_canvas_and_open_second_pdf():
+    from PySide6.QtCore import QMimeData, QPointF, QUrl, Qt
+    from PySide6.QtGui import QDropEvent
+    from PySide6.QtWidgets import QApplication
+    from ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.resize(960, 640)
+    win.show()
+    app.processEvents()
+    check("空白工作台", win.doc is None)
+    check("空白提示可见", win.canvas.empty_prompt_visible())
+
+    p1 = _one_page_pdf("文档甲甲甲专属标记")
+    p2 = _one_page_pdf("文档乙乙乙另一份")
+    try:
+        win.open_file(p1)
+        app.processEvents()
+        check("第一份已打开", win.doc is not None)
+        check("画布是第一份",
+              any("甲甲甲" in b.text() for b in win.page_model().blocks))
+        check("打开后提示隐藏", not win.canvas.empty_prompt_visible())
+        title1 = win.windowTitle()
+        check("标题含第一份文件名", os.path.basename(p1) in title1)
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(os.path.abspath(p2))])
+        ev = QDropEvent(QPointF(80, 80), Qt.DropAction.CopyAction, mime,
+                        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        win.canvas.dropEvent(ev)
+        app.processEvents()
+        check("拖放打开第二份", win.doc is not None)
+        check("标题已换成第二份", os.path.basename(p2) in win.windowTitle())
+        check("画布已换成第二份",
+              any("乙乙乙" in b.text() for b in win.page_model().blocks))
+        check("画布不再是第一份",
+              not any("甲甲甲" in b.text() for b in win.page_model().blocks))
+        check("画布模型对应当前页", win.canvas.model is win.page_model())
+        check("目录页数为一", win.thumb_list.count() == 1)
+    finally:
+        if win.session is not None:
+            win.cancel_session()
+        win.undo_stack.clear()
+        if win.doc is not None:
+            try:
+                win.doc.close()
+            except Exception:
+                pass
+            win.doc = None
+        win.close()
+        for p in (p1, p2):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
