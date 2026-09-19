@@ -2,37 +2,27 @@
 
 桌面端 PDF 编辑器：以文本框为单元做类 PPT 编辑。提交时改的是 PDF **内容流**（真删除 + 原位重建），不是在页面上盖一层字。撤销通过页面字节快照回到原版。
 
-**作者：** [Sala](https://github.com/Sylas-Lake)、[sh1man2357](https://github.com/sh1man2357)
+**作者：** [Sala](https://github.com/Sylas-Lake)、[sh1man2357](https://github.com/sh1man2357)  
+**版本：** [v0.2.0](https://github.com/Sylas-Lake/pdf_seamless_editor/releases/tag/v0.2.0) · [AGPL-3.0](LICENSE)
 
-当前版本 **v0.2.0**。免费开源，欢迎使用、改、再分发（见 [许可证](#许可证)）。
+![程序界面](docs/screenshot.png)
 
-## 安装与运行
+## 下载
 
-需要 **Python 3.10+**，Windows / macOS / Linux 均可（界面依赖 Qt）。
+Windows 10/11（64 位），到 [Releases](https://github.com/Sylas-Lake/pdf_seamless_editor/releases/tag/v0.2.0) 取最新包：
 
-```bash
-git clone https://github.com/Sylas-Lake/pdf_seamless_editor.git
-cd pdf_seamless_editor
+| 文件 | 说明 |
+|------|------|
+| [PDFSeamlessEditor-0.2.0-windows-x64-setup.exe](https://github.com/Sylas-Lake/pdf_seamless_editor/releases/download/v0.2.0/PDFSeamlessEditor-0.2.0-windows-x64-setup.exe) | 安装程序（约 53 MB）。开始菜单快捷方式，可选桌面图标 |
+| [PDFSeamlessEditor-0.2.0-windows-x64.zip](https://github.com/Sylas-Lake/pdf_seamless_editor/releases/download/v0.2.0/PDFSeamlessEditor-0.2.0-windows-x64.zip) | 便携版。解压后运行 `PDFSeamlessEditor.exe` |
 
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
+安装向导会出示 AGPL 许可证。本程序**不会**改成系统默认 PDF 打开方式；可在资源管理器「打开方式」里选用。
 
-pip install -r requirements.txt
-python main.py
-```
-
-启动后是空工作台：点页面打开 PDF，或把 PDF 拖进去。也可以指定文件：
-
-```bash
-python main.py --demo 你的文件.pdf
-```
-
-开发安装（含测试工具）：`pip install -e ".[dev]"`。
+macOS / Linux 请 [从源码运行](#从源码运行)。
 
 ## 怎么用
+
+启动后是空工作台：点页面打开 PDF，或把文件拖进去。
 
 - **单击**文本框：选中；拖动移动；左右手柄调宽
 - **双击**文本框：进入框内编辑（光标、选区、输入法）
@@ -51,9 +41,33 @@ python main.py --demo 你的文件.pdf
 
 - 部分 PDF 的斜体在编辑后可能掉成正体，可用斜体按钮手动加回
 - 扫描页（纯图片）不能当文字改
-- 第一版请从源码运行；安装包以后再挂到 Release
+- 目前只有 Windows 安装包；其它系统从源码运行
 
 问题请开 [Issues](https://github.com/Sylas-Lake/pdf_seamless_editor/issues)。
+
+## 从源码运行
+
+需要 **Python 3.10+**，Windows / macOS / Linux 均可（界面依赖 Qt）。
+
+```bash
+git clone https://github.com/Sylas-Lake/pdf_seamless_editor.git
+cd pdf_seamless_editor
+
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+python main.py
+```
+
+指定文件启动：
+
+```bash
+python main.py 你的文件.pdf
+```
 
 ## 许可证
 
@@ -66,6 +80,7 @@ PDF 引擎使用 [PyMuPDF](https://pymupdf.readthedocs.io/)（Artifex），同�
 ## 开发
 
 ```bash
+pip install -e ".[dev]"
 pytest -m "not gui"     # 核心（无头，CI 默认）
 pytest -m gui           # GUI 冒烟（需显示或 QT_QPA_PLATFORM=offscreen）
 ruff check core ui tests main.py
@@ -77,11 +92,20 @@ ruff check core ui tests main.py
 python -c "from core.sample import create_sample_pdf; create_sample_pdf('demo.pdf')"
 ```
 
+打 Windows 安装包（第一次会建 `.packaging-venv`；本机需安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 才会生成 setup.exe）：
+
+```bash
+powershell -File packaging/build.ps1
+```
+
+产物在 `dist/`。
+
 | 路径 | 职责 |
 |------|------|
 | `main.py` | 入口 |
 | `core/` | PDF 引擎（无 Qt） |
 | `ui/` | PySide6 界面 |
+| `packaging/` | Windows 安装包（PyInstaller + Inno Setup） |
 | `tests/` | pytest |
 
-Agent / 合入约定见 [AGENTS.md](AGENTS.md)。
+合入约定见 [AGENTS.md](AGENTS.md)。
