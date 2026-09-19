@@ -15,6 +15,7 @@ htmlcov/
 
 # Virtualenv
 .venv/
+.packaging-venv/
 venv/
 env/
 _bootstrap/

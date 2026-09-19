@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QToolButton, QVBoxLayout, QWidget)
 
+from core.appinfo import APP_AUTHORS, APP_TITLE, APP_VERSION
 from core.compat import fitz
 from core import executor, render, verifier
 from core.commands import (ImageReplaceCommand, PageStateCommand, UndoStack)
@@ -34,15 +35,15 @@ from ui.session import EditSession
 from ui.stage import StageHost
 from ui.theme import APP_QSS
 
-APP_TITLE = "PDF 无感编辑器 · 文本框编辑版"
-APP_VERSION = "0.2.0"
-
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1280, 860)
+        icon = QApplication.windowIcon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
 
         self.doc = None
         self.doc_path = ""
@@ -1261,7 +1262,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "关于",
             f"<b>PDF 无感编辑器</b>  v{APP_VERSION}<br><br>"
-            "作者：Sala、sh1man2357<br><br>"
+            f"作者：{APP_AUTHORS}<br><br>"
             "类 PPT 交互：单击选中文本框（拖动/调宽），双击进入框内编辑；"
             "图片拖动/缩放/旋转。<br>"
             "编辑直接修改内容流（真删除，非遮盖）；撤销为<b>页面快照字节级恢复</b>，"

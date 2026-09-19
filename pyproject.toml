@@ -15,7 +15,7 @@ authors = [
 ]
 dependencies = [
     "PyMuPDF>=1.24,<1.29",
-    "PySide6>=6.5,<6.12",
+    "PySide6-Essentials>=6.5,<6.12",
     "Pillow>=10,<13",
     "numpy>=1.24,<3",
 ]
@@ -28,6 +28,9 @@ Issues = "https://github.com/Sylas-Lake/pdf_seamless_editor/issues"
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+pack = [
+    "pyinstaller>=6.3",
 ]
 
 [project.scripts]
