@@ -35,6 +35,7 @@ from ui.stage import StageHost
 from ui.theme import APP_QSS
 
 APP_TITLE = "PDF 无感编辑器 · 文本框编辑版"
+APP_VERSION = "0.2.0"
 
 
 class MainWindow(QMainWindow):
@@ -1259,11 +1260,14 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(
             self, "关于",
-            "<b>PDF 无感编辑器（文本框编辑版）</b><br><br>"
+            f"<b>PDF 无感编辑器</b>  v{APP_VERSION}<br><br>"
+            "作者：Sala、sh1man2357<br><br>"
             "类 PPT 交互：单击选中文本框（拖动/调宽），双击进入框内编辑；"
             "图片拖动/缩放/旋转。<br>"
             "编辑直接修改内容流（真删除，非遮盖）；撤销为<b>页面快照字节级恢复</b>，"
-            "可回到原版 PDF；保存后自动执行结构校验与视觉回归验证。")
+            "可回到原版 PDF；保存后自动执行结构校验与视觉回归验证。<br><br>"
+            "本软件按 GNU Affero General Public License v3.0 发布，不含任何担保。"
+            "完整条款见仓库 LICENSE。PDF 引擎使用 PyMuPDF（Artifex）。")
 
     def closeEvent(self, e):
         if self.session is not None:

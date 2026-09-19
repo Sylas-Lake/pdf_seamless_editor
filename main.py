@@ -1,5 +1,8 @@
 """PDF 无感编辑器 · 程序入口。
 
+Copyright (C) 2026 Sala, sh1man2357
+SPDX-License-Identifier: AGPL-3.0-only
+
 用法：
   python main.py                       # 正常启动
   python main.py --demo 示例文档.pdf    # 启动并打开指定文件
