@@ -203,6 +203,20 @@ def test_gui_smoke(window):
         win.commit_block_transform(blk, 30, 0, 0, "移动文本框")
         check("框移动提交", win.undo_stack.can_undo)
         check("移动后文本完好", "供货合同" in win.doc[0].get_text())
+        check("移动后仍选中", win.selected_block is not None)
+        moved = win.selected_block
+        check("移动后蓝框跟着走",
+              abs(win.canvas.handle_layer.rect.left() - moved.bbox[0]) < 1.2
+              and abs(win.canvas.handle_layer.rect.top() - moved.bbox[1]) < 1.2
+              and abs(moved.bbox[0] - (blk.bbox[0] + 30)) < 8)
+        x_before = moved.bbox[0]
+        y_before = moved.bbox[1]
+        check("方向键左移", win.nudge_selected_block(-6, 0))
+        check("左移不改纵向",
+              abs(win.selected_block.bbox[1] - y_before) < 1.5
+              and win.selected_block.bbox[0] < x_before - 3)
+        check("左移后蓝框同步",
+              abs(win.canvas.handle_layer.rect.left() - win.selected_block.bbox[0]) < 1.2)
 
     win.set_page(1)
     app.processEvents()
