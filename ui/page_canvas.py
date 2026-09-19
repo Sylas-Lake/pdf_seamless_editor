@@ -669,12 +669,29 @@ class PageCanvas(QGraphicsView):
             c.delete_selected_image()
             e.accept()
             return
-        # 选中文本框：Delete 删除框内容
-        if c.selected_block is not None and c.session is None and key in (
-                Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            c.delete_selected_block()
-            e.accept()
-            return
+        # 选中文本框：Delete 删除框内容；方向键轴向平移
+        if c.selected_block is not None and c.session is None:
+            if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                c.delete_selected_block()
+                e.accept()
+                return
+            step = 10.0 if (mods & Qt.KeyboardModifier.ShiftModifier) else 1.0
+            if key == Qt.Key.Key_Left:
+                c.nudge_selected_block(-step, 0.0)
+                e.accept()
+                return
+            if key == Qt.Key.Key_Right:
+                c.nudge_selected_block(step, 0.0)
+                e.accept()
+                return
+            if key == Qt.Key.Key_Up:
+                c.nudge_selected_block(0.0, -step)
+                e.accept()
+                return
+            if key == Qt.Key.Key_Down:
+                c.nudge_selected_block(0.0, step)
+                e.accept()
+                return
 
         if self.session_active():
             self._session_key(e)

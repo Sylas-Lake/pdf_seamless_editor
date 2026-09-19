@@ -443,7 +443,7 @@ class MainWindow(QMainWindow):
         self.selected_block = block
         self.selected_image = None
         self.canvas.refresh_overlays()
-        self.status_hint("文本框已选中：拖动移动，左右手柄调宽；双击进入编辑；Delete 删除")
+        self.status_hint("文本框已选中：拖动移动，方向键平移，左右手柄调宽；双击进入编辑；Delete 删除")
 
     def select_image(self, img):
         if not self._editable():
@@ -600,7 +600,13 @@ class MainWindow(QMainWindow):
             fid.level = worse(fid.level, level)
         for r in getattr(cmd, "edit_rects", []) or []:
             self.edit_regions.setdefault(self.page_no, []).append(tuple(r))
-        self._refresh_page()
+        hint = None
+        if buffer is not None:
+            try:
+                hint = buffer.bbox()
+            except Exception:
+                hint = None
+        self._refresh_page(block_hint=hint)
 
     # ================================================== 会话编辑操作
     def session_click(self, x, y, extend=False):
@@ -953,6 +959,18 @@ class MainWindow(QMainWindow):
         cmd.edit_rects = [_expand(block.bbox, 1.0), buffer.bbox()]
         self._register_cmd(cmd, buffer, runs)
 
+    def nudge_selected_block(self, dx: float, dy: float) -> bool:
+        """选中文本框时按轴向平移（方向键）。成功返回 True。"""
+        if self.session is not None:
+            return False
+        block = self.selected_block
+        if block is None or not self._editable():
+            return False
+        if abs(dx) < 0.01 and abs(dy) < 0.01:
+            return False
+        self.commit_block_transform(block, dx, dy, 0, "平移文本框")
+        return True
+
     def delete_selected_block(self):
         if not self._editable() or self.selected_block is None:
             return
@@ -1075,9 +1093,11 @@ class MainWindow(QMainWindow):
                                      model.rect[2], model.rect[3])
         self.canvas.apply_zoom()
 
-    def _refresh_page(self):
+    def _refresh_page(self, block_hint=None, image_hint=None):
         if self.doc is None:
             return
+        old_blk = self.selected_block
+        old_img = self.selected_image
         page = self.doc[self.page_no]
         model = extract_page(page, self.page_no)
         self.models[self.page_no] = model
@@ -1085,6 +1105,10 @@ class MainWindow(QMainWindow):
         self.canvas.zoom = self.zoom
         self.canvas.set_page_content(pm, model, model.rect[2], model.rect[3])
         self.canvas.apply_zoom()
+        if old_blk is not None:
+            self.selected_block = _match_block(model, old_blk, block_hint)
+        if old_img is not None:
+            self.selected_image = _match_image(model, old_img, image_hint)
         self.canvas.refresh_overlays()
         self._update_thumb(self.page_no)
         self._update_panels()
@@ -1258,6 +1282,60 @@ class MainWindow(QMainWindow):
 
 def _expand(rect, m):
     return (rect[0] - m, rect[1] - m, rect[2] + m, rect[3] + m)
+
+
+def _rect_center(r):
+    return ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
+
+
+def _match_block(model, old, hint=None):
+    """页面重提取后，把选中框绑到新模型里对应的文本框。"""
+    if old is None or model is None:
+        return None
+    blocks = getattr(model, "blocks", None) or []
+    if not blocks:
+        return None
+    hint = hint or getattr(old, "bbox", None)
+    old_text = (old.text() or "").strip()
+    hx, hy = _rect_center(hint) if hint is not None else (0.0, 0.0)
+    best, best_score = None, -1e9
+    for b in blocks:
+        bbox = b.bbox
+        iou = _rect_iou(bbox, hint) if hint is not None else 0.0
+        t = (b.text() or "").strip()
+        if old_text and t == old_text:
+            text_s = 1.0
+        elif old_text and t and (old_text in t or t in old_text):
+            text_s = 0.45
+        else:
+            text_s = 0.0
+        cx, cy = _rect_center(bbox)
+        dist = abs(cx - hx) + abs(cy - hy)
+        score = iou * 3.0 + text_s * 2.0 - dist / 400.0
+        if score > best_score:
+            best_score, best = score, b
+    if best is None or best_score < 0.2:
+        return None
+    return best
+
+
+def _match_image(model, old, hint=None):
+    if old is None or model is None:
+        return None
+    images = getattr(model, "images", None) or []
+    if not images:
+        return None
+    hint = hint or getattr(old, "rect", None)
+    best, best_score = None, -1.0
+    for im in images:
+        s = _rect_iou(im.rect, hint) if hint is not None else 0.0
+        if getattr(old, "xref", None) and im.xref == old.xref:
+            s += 0.5
+        if s > best_score:
+            best_score, best = s, im
+    if best is None or best_score < 0.2:
+        return None
+    return best
 
 
 def _rect_iou(a, b):
